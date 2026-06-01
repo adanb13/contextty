@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextty"
+version = "0.0.1"
+description = "Backend tools for turning approved Postgres sources into local AI-readable context artifacts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Contextty Contributors" }]
+dependencies = [
+  "click>=8.1",
+  "fastapi>=0.100",
+  "pydantic>=1.10",
+  "uvicorn>=0.23",
+  "networkx>=3.0",
+  "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "httpx>=0.24",
+]
+mcp = [
+  "mcp>=1.0",
+]
+
+[project.scripts]
+contextty = "contextty.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "integration: tests that require external services",
+]

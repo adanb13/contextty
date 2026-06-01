@@ -11,7 +11,7 @@ from typing import Any
 from .models import SnapshotRun, Source
 
 DEFAULT_STORE_PATH = Path(".contextty") / "contextty.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def default_store_path() -> Path:
@@ -57,8 +57,9 @@ class LocalStore:
                 CREATE TABLE IF NOT EXISTS sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
-                    connector_type TEXT NOT NULL CHECK (connector_type = 'postgres'),
-                    dsn_env TEXT NOT NULL,
+                    connector_type TEXT NOT NULL CHECK (connector_type IN ('postgres', 'sqlite')),
+                    dsn_env TEXT,
+                    path TEXT,
                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -133,24 +134,36 @@ class LocalStore:
         self,
         name: str,
         connector_type: str,
-        dsn_env: str,
+        dsn_env: str | None = None,
+        path: str | os.PathLike[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Source:
-        if connector_type != "postgres":
-            raise ValueError("v0.0.1 only supports connector type 'postgres'")
+        if connector_type == "postgres":
+            if not dsn_env:
+                raise ValueError("Postgres sources require dsn_env")
+            path_value = None
+            dsn_env_value: str | None = dsn_env
+        elif connector_type == "sqlite":
+            if not path:
+                raise ValueError("SQLite sources require path")
+            path_value = str(Path(path).expanduser().resolve())
+            dsn_env_value = None
+        else:
+            raise ValueError("connector_type must be one of: postgres, sqlite")
         metadata = metadata or {}
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO sources(name, connector_type, dsn_env, metadata_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO sources(name, connector_type, dsn_env, path, metadata_json)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     connector_type = excluded.connector_type,
                     dsn_env = excluded.dsn_env,
+                    path = excluded.path,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     metadata_json = excluded.metadata_json
                 """,
-                (name, connector_type, dsn_env, dumps_json(metadata)),
+                (name, connector_type, dsn_env_value, path_value, dumps_json(metadata)),
             )
         return self.get_source(name)
 
@@ -381,6 +394,7 @@ class LocalStore:
             name=row["name"],
             connector_type=row["connector_type"],
             dsn_env=row["dsn_env"],
+            path=row["path"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             metadata=loads_json(row["metadata_json"]),

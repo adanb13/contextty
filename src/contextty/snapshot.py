@@ -49,10 +49,12 @@ class ArtifactBuilder:
     def build(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         source_id = make_node_id("source", self.source.name)
         db_id = make_node_id("database", self.source.name, self.inspection.database)
-        self._add_node(source_id, "source", self.source.name, self.source.name, None, "Registered Postgres source", {
-            "connector_type": self.source.connector_type,
-            "dsn_env": self.source.dsn_env,
-        })
+        source_properties = {"connector_type": self.source.connector_type}
+        if self.source.connector_type == "postgres":
+            source_properties["dsn_env"] = self.source.dsn_env
+        elif self.source.connector_type == "sqlite":
+            source_properties["path"] = self.source.path
+        self._add_node(source_id, "source", self.source.name, self.source.name, None, "Registered source", source_properties)
         self._add_node(db_id, "database", self.inspection.database, self.inspection.database, source_id, None, {})
         self._add_edge(source_id, db_id, "contains")
 
@@ -106,6 +108,9 @@ class ArtifactBuilder:
         view_id = make_node_id("view", self.source.name, table.database, table.schema, table.name)
         self._table_ids[(table.schema, table.name)] = view_id
         properties = asdict(table)
+        view_info = self._view_for(table)
+        if view_info:
+            properties["definition"] = view_info.definition
         self._add_node(view_id, "view", table.name, table.qualified_name, parent_id, f"View {table.qualified_name}", properties)
         self._add_edge(parent_id, view_id, "contains")
         return view_id
@@ -275,6 +280,12 @@ class ArtifactBuilder:
 
     def _indexes_for(self, table: TableInfo) -> list[IndexInfo]:
         return [index for index in self.inspection.indexes if index.schema == table.schema and index.table == table.name]
+
+    def _view_for(self, table: TableInfo) -> Any | None:
+        for view in self.inspection.views:
+            if view.schema == table.schema and view.name == table.name:
+                return view
+        return None
 
     def _is_pk(self, column: ColumnInfo) -> bool:
         return any(

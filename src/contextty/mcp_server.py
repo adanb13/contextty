@@ -4,9 +4,11 @@ import json
 import sys
 from typing import Any, Callable
 
-from .connectors.postgres import parse_timeout
+from .connectors.common import parse_timeout
 from .models import SnapshotOptions
 from .services import (
+    add_source,
+    detect,
     get_neighbors,
     get_node,
     inspect_source,
@@ -22,6 +24,8 @@ class MCPServer:
     def __init__(self, store: LocalStore | None = None) -> None:
         self.store = store or LocalStore()
         self._handlers: dict[str, Callable[[dict[str, Any]], Any]] = {
+            "detect_sources": self._detect_sources,
+            "add_source": self._add_source,
             "list_sources": self._list_sources,
             "inspect_source": self._inspect_source,
             "refresh_snapshot": self._refresh_snapshot,
@@ -34,13 +38,40 @@ class MCPServer:
     def list_tools(self) -> list[dict[str, Any]]:
         return [
             {
+                "name": "detect_sources",
+                "description": "Detect Postgres and SQLite sources under a project path.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "default": "."},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "add_source",
+                "description": "Register or update a Contextty source using connector-specific fields.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string", "enum": ["postgres", "sqlite"]},
+                        "dsn_env": {"type": "string"},
+                        "path": {"type": "string"},
+                        "metadata": {"type": "object", "default": {}},
+                    },
+                    "required": ["name", "type"],
+                    "additionalProperties": False,
+                },
+            },
+            {
                 "name": "list_sources",
                 "description": "List registered Contextty sources.",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
             },
             {
                 "name": "inspect_source",
-                "description": "Inspect a registered Postgres source using a read-only connection.",
+                "description": "Inspect a registered source using a read-only connection.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -53,7 +84,7 @@ class MCPServer:
             },
             {
                 "name": "refresh_snapshot",
-                "description": "Refresh a local snapshot for a registered Postgres source.",
+                "description": "Refresh a local snapshot for a registered source.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -176,6 +207,19 @@ class MCPServer:
 
     def _list_sources(self, _arguments: dict[str, Any]) -> Any:
         return list_sources(self.store)
+
+    def _detect_sources(self, arguments: dict[str, Any]) -> Any:
+        return detect(arguments.get("path", "."))
+
+    def _add_source(self, arguments: dict[str, Any]) -> Any:
+        return add_source(
+            self.store,
+            arguments["name"],
+            arguments["type"],
+            dsn_env=arguments.get("dsn_env"),
+            path=arguments.get("path"),
+            metadata=arguments.get("metadata") or {},
+        )
 
     def _inspect_source(self, arguments: dict[str, Any]) -> Any:
         return inspect_source(

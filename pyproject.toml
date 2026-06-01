@@ -5,11 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "contextty"
 version = "0.0.1"
-description = "Backend tools for turning approved Postgres sources into local AI-readable context artifacts."
+description = "Local database context for AI agents: read-only snapshots, relationship graphs, and bounded profiling through CLI, API, and MCP."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Contextty Contributors" }]
+keywords = ["ai", "agents", "mcp", "database", "schema", "metadata", "postgresql", "sqlite", "graph"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "click>=8.1",
   "fastapi>=0.100",
@@ -18,6 +31,11 @@ dependencies = [
   "networkx>=3.0",
   "psycopg[binary]>=3.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/adanb13/contextty"
+Repository = "https://github.com/adanb13/contextty"
+Issues = "https://github.com/adanb13/contextty/issues"
 
 [project.optional-dependencies]
 dev = [

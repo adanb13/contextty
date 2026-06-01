@@ -1,8 +1,26 @@
 from __future__ import annotations
 
 from contextty.graph import ContextGraph
+from contextty.storage import LocalStore
 
-from .helpers import populated_store
+from .helpers import populated_store, sqlite_fixture_db
+
+
+def test_source_storage_uses_connector_specific_locator_fields(tmp_path) -> None:
+    sqlite_path = sqlite_fixture_db(tmp_path)
+    store = LocalStore(tmp_path / "contextty.db")
+
+    postgres = store.add_source("pg-db", "postgres", dsn_env="DATABASE_URL")
+    sqlite = store.add_source("local-db", "sqlite", path=sqlite_path)
+
+    assert postgres.dsn_env == "DATABASE_URL"
+    assert postgres.path is None
+    assert sqlite.dsn_env is None
+    assert sqlite.path and sqlite.path.endswith("app.sqlite3")
+
+    with store.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
+    assert {"connector_type", "dsn_env", "path"} <= columns
 
 
 def test_snapshot_artifact_contains_expected_nodes_edges_and_pills(tmp_path) -> None:

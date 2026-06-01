@@ -4,9 +4,10 @@ from dataclasses import asdict
 from typing import Any
 
 from .connectors.postgres import PostgresConnector, PostgresIntrospector
+from .connectors.sqlite import SQLiteConnector, SQLiteIntrospector
 from .detect import detect_project
 from .graph import ContextGraph
-from .models import InspectionResult, SnapshotOptions
+from .models import InspectionResult, SnapshotOptions, Source
 from .snapshot import build_artifact
 from .storage import LocalStore
 
@@ -19,10 +20,11 @@ def add_source(
     store: LocalStore,
     name: str,
     connector_type: str,
-    dsn_env: str,
+    dsn_env: str | None = None,
+    path: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return asdict(store.add_source(name, connector_type, dsn_env, metadata))
+    return asdict(store.add_source(name, connector_type, dsn_env=dsn_env, path=path, metadata=metadata))
 
 
 def list_sources(store: LocalStore) -> list[dict[str, Any]]:
@@ -33,15 +35,15 @@ def inspect_source(
     store: LocalStore,
     source_name: str,
     timeout_seconds: float = 5.0,
-    introspector: PostgresIntrospector | None = None,
+    introspector: Any | None = None,
 ) -> dict[str, Any]:
     source = store.get_source(source_name)
-    if source.connector_type != "postgres":
-        raise ValueError("v0.0.1 only supports Postgres sources")
-    introspector = introspector or PostgresIntrospector()
-    connector = PostgresConnector.from_env(source.dsn_env, timeout_seconds=timeout_seconds)
-    with connector.connect() as conn:
-        inspection = introspector.inspect(conn)
+    inspection, _profiles = _inspect_and_profile(
+        source,
+        SnapshotOptions(profile_mode="basic", timeout_seconds=timeout_seconds),
+        introspector=introspector,
+        include_profiles=False,
+    )
     return inspection_to_dict(inspection)
 
 
@@ -51,7 +53,7 @@ def refresh_snapshot(
     options: SnapshotOptions,
     inspection: InspectionResult | None = None,
     profiles: dict[tuple[str, str], Any] | None = None,
-    introspector: PostgresIntrospector | None = None,
+    introspector: Any | None = None,
 ) -> dict[str, Any]:
     source = store.get_source(source_name)
     run = store.create_snapshot_run(
@@ -62,11 +64,12 @@ def refresh_snapshot(
     )
     try:
         if inspection is None:
-            introspector = introspector or PostgresIntrospector()
-            connector = PostgresConnector.from_env(source.dsn_env, timeout_seconds=options.timeout_seconds)
-            with connector.connect() as conn:
-                inspection = introspector.inspect(conn)
-                profiles = introspector.profile(conn, inspection, options)
+            inspection, profiles = _inspect_and_profile(
+                source,
+                options,
+                introspector=introspector,
+                include_profiles=True,
+            )
         nodes, edges, pills = build_artifact(source, run, inspection, profiles)
         store.replace_artifact(source.id, run.id, nodes, edges, pills)
         run = store.finish_snapshot_run(
@@ -130,6 +133,31 @@ def find_path(store: LocalStore, start_node_id: str, end_node_id: str, direction
 def graph_summary(store: LocalStore, source_name: str | None = None) -> dict[str, Any]:
     source_id = store.get_source(source_name).id if source_name else None
     return ContextGraph(store, source_id=source_id).graph_summary()
+
+
+def _inspect_and_profile(
+    source: Source,
+    options: SnapshotOptions,
+    introspector: Any | None = None,
+    include_profiles: bool = True,
+) -> tuple[InspectionResult, dict[tuple[str, str], Any] | None]:
+    if source.connector_type == "postgres":
+        if not source.dsn_env:
+            raise ValueError(f"Postgres source {source.name} is missing dsn_env")
+        active_introspector = introspector or PostgresIntrospector()
+        connector = PostgresConnector.from_env(source.dsn_env, timeout_seconds=options.timeout_seconds)
+    elif source.connector_type == "sqlite":
+        if not source.path:
+            raise ValueError(f"SQLite source {source.name} is missing path")
+        active_introspector = introspector or SQLiteIntrospector(timeout_seconds=options.timeout_seconds)
+        connector = SQLiteConnector(source.path, timeout_seconds=options.timeout_seconds)
+    else:
+        raise ValueError(f"unsupported connector type: {source.connector_type}")
+
+    with connector.connect() as conn:
+        inspection = active_introspector.inspect(conn)
+        profiles = active_introspector.profile(conn, inspection, options) if include_profiles else None
+    return inspection, profiles
 
 
 def inspection_to_dict(inspection: InspectionResult) -> dict[str, Any]:

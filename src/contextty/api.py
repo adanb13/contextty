@@ -4,15 +4,12 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-try:
-    from pydantic import ConfigDict
-except ImportError:  # pragma: no cover - pydantic v1 compatibility.
-    ConfigDict = None  # type: ignore[assignment]
 
-from .connectors.postgres import parse_timeout
+from .connectors.common import parse_timeout
 from .models import SnapshotOptions
 from .services import (
     add_source,
+    detect,
     get_neighbors,
     get_node,
     graph_summary,
@@ -24,19 +21,11 @@ from .services import (
 from .storage import LocalStore
 
 
-if ConfigDict is not None:
-    class _AliasModel(BaseModel):
-        model_config = ConfigDict(populate_by_name=True)
-else:  # pragma: no cover - exercised only with pydantic v1.
-    class _AliasModel(BaseModel):
-        class Config:
-            allow_population_by_field_name = True
-
-
-class SourceCreate(_AliasModel):
+class SourceCreate(BaseModel):
     name: str
-    connector_type: str = Field(default="postgres", alias="type")
-    dsn_env: str
+    type: str = "postgres"
+    dsn_env: str | None = None
+    path: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -69,15 +58,20 @@ def create_app(store: LocalStore | None = None) -> FastAPI:
     def sources() -> list[dict[str, Any]]:
         return list_sources(store)
 
+    @app.get("/v1/detect")
+    def detect_sources(path: str = ".") -> dict[str, Any]:
+        return detect(path)
+
     @app.post("/v1/sources")
     def create_source(request: SourceCreate) -> dict[str, Any]:
         try:
             return add_source(
                 store,
                 request.name,
-                request.connector_type,
-                request.dsn_env,
-                request.metadata,
+                request.type,
+                dsn_env=request.dsn_env,
+                path=request.path,
+                metadata=request.metadata,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

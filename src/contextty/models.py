@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-ConnectorType = Literal["postgres"]
+ConnectorType = Literal["postgres", "sqlite"]
 ProfileMode = Literal["basic", "deep"]
 
 
@@ -12,7 +12,8 @@ class Source:
     id: int
     name: str
     connector_type: ConnectorType
-    dsn_env: str
+    dsn_env: str | None
+    path: str | None
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = field(default_factory=dict)

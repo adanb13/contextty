@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from dataclasses import asdict
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 import click
 
 from .api import create_app
-from .connectors.postgres import parse_timeout
+from .connectors.common import parse_timeout
 from .mcp_server import MCPServer
 from .models import SnapshotOptions
 from .services import (
@@ -39,8 +40,37 @@ def main() -> None:
 @main.command("detect")
 @click.argument("path", default=".", required=False, type=click.Path(exists=True))
 def detect_cmd(path: str) -> None:
-    """Detect likely Postgres source configuration in a project."""
-    _json(detect(path))
+    """Detect likely database source configuration in a project."""
+    result = detect(path)
+    if not _detect_interactive():
+        _json(result)
+        return
+
+    registered: list[dict[str, Any]] = []
+    sources = result.get("sources", [])
+    if not sources:
+        click.echo("No database sources detected.")
+        _json({"detection": result, "registered": registered})
+        return
+
+    store = _store()
+    for candidate in sources:
+        label = _candidate_label(candidate)
+        if not click.confirm(f"Register {label}?", default=False):
+            continue
+        name = click.prompt("Source name", default=candidate.get("name") or "source")
+        metadata = {"detected_from": candidate.get("source"), "confidence": candidate.get("confidence")}
+        registered.append(
+            add_source(
+                store,
+                name,
+                candidate["connector_type"],
+                dsn_env=candidate.get("dsn_env"),
+                path=candidate.get("path"),
+                metadata=metadata,
+            )
+        )
+    _json({"detection": result, "registered": registered})
 
 
 @main.group("source")
@@ -50,12 +80,13 @@ def source_group() -> None:
 
 @source_group.command("add")
 @click.argument("name")
-@click.option("--type", "connector_type", required=True, type=click.Choice(["postgres"]), help="Connector type.")
-@click.option("--dsn-env", required=True, help="Environment variable containing the Postgres DSN.")
-def source_add_cmd(name: str, connector_type: str, dsn_env: str) -> None:
+@click.option("--type", "connector_type", required=True, type=click.Choice(["postgres", "sqlite"]), help="Connector type.")
+@click.option("--dsn-env", default=None, help="Environment variable containing the Postgres DSN.")
+@click.option("--path", "source_path", default=None, type=click.Path(), help="SQLite database path.")
+def source_add_cmd(name: str, connector_type: str, dsn_env: str | None, source_path: str | None) -> None:
     """Register or update a source."""
     try:
-        _json(add_source(_store(), name, connector_type, dsn_env))
+        _json(add_source(_store(), name, connector_type, dsn_env=dsn_env, path=source_path))
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -70,7 +101,7 @@ def source_list_cmd() -> None:
 @click.argument("source_name")
 @click.option("--timeout", default="5s", show_default=True, help="Statement timeout, e.g. 500ms, 5s, 1m.")
 def inspect_cmd(source_name: str, timeout: str) -> None:
-    """Inspect a registered Postgres source without writing a snapshot."""
+    """Inspect a registered source without writing a snapshot."""
     try:
         _json(inspect_source(_store(), source_name, timeout_seconds=parse_timeout(timeout)))
     except Exception as exc:
@@ -150,6 +181,18 @@ def _run_uvicorn(host: str, port: int) -> None:
     import uvicorn
 
     uvicorn.run(create_app(_store()), host=host, port=port)
+
+
+def _detect_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _candidate_label(candidate: dict[str, Any]) -> str:
+    if candidate["connector_type"] == "postgres":
+        return f"Postgres source from {candidate.get('dsn_env')}"
+    if candidate["connector_type"] == "sqlite":
+        return f"SQLite source at {candidate.get('path')}"
+    return f"{candidate['connector_type']} source"
 
 
 if __name__ == "__main__":

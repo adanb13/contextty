@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 from contextty.models import (
     ColumnInfo,
     ColumnProfile,
@@ -103,3 +106,50 @@ def populated_store(tmp_path) -> tuple[LocalStore, Source]:
     store.replace_artifact(source.id, run.id, nodes, edges, pills)
     store.finish_snapshot_run(run.id, "success", metadata={"nodes": len(nodes), "edges": len(edges), "pills": len(pills)})
     return store, source
+
+
+def sqlite_fixture_db(tmp_path) -> Path:
+    path = Path(tmp_path) / "app.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                signup_state TEXT,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                total_cents INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX orders_user_id_idx ON orders(user_id)")
+        conn.execute(
+            """
+            CREATE VIEW verified_users AS
+            SELECT id, email
+            FROM users
+            WHERE signup_state = 'verified'
+            """
+        )
+        conn.executemany(
+            "INSERT INTO users(id, email, signup_state, created_at) VALUES (?, ?, ?, ?)",
+            [
+                (1, "a@example.com", "verified", "2026-01-01T00:00:00"),
+                (2, "b@example.com", "pending", "2026-01-02T00:00:00"),
+                (3, "c@example.com", None, "2026-01-02T02:00:00"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO orders(id, user_id, total_cents) VALUES (?, ?, ?)",
+            [(1, 1, 500), (2, 1, 750), (3, 2, 1250)],
+        )
+    return path

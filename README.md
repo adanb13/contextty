@@ -112,6 +112,37 @@ After a snapshot is built, `contextty query` searches the local fact index
 first. If no answer-ready fact matches, it falls back to compact graph context
 with the involved tables and columns.
 
+## How Contextty Works
+
+Contextty separates database-specific extraction from connector-neutral
+retrieval.
+
+1. **Connector-specific inspection** reads an approved source through an
+   isolated connector. Each connector owns its connection method, SQL dialect,
+   schema introspection, profiling queries, and read-only guardrails.
+2. **Connector-neutral artifact graph** converts schemas, tables, views,
+   columns, indexes, primary keys, and foreign keys into the same local
+   node/edge artifact regardless of database type.
+3. **Compact fact extraction** turns schema and bounded profile data into
+   answer-ready facts: table inventories, table schemas, value domains,
+   relationship cards, entity labels, foreign-key relationships, bridge
+   assignments, latest metrics, and grouped aggregates.
+4. **Deterministic retrieval** uses `query_context` to search the local fact
+   index first with normalized tokens, lexical overlap, phrase matching, schema
+   routing hints, and deterministic hashed-vector reranking.
+5. **Budgeted context rendering** returns compact `answer_candidates` and
+   context within the requested budget. If no bounded snapshot fact can answer
+   a row-level question, `query_context` marks the result as needing database
+   fallback instead of querying the live database.
+
+In generated benchmark suites, Contextty matched direct database answers while
+answering from the local snapshot without fallback.
+
+Each new database type can have its own connector and context extractor for
+source-specific inspection and profiling, while reusing the shared artifact
+builder, fact model, local fact index, graph traversal, answerability status,
+rendering strategy, and shared CLI, API, and MCP query behavior.
+
 ## Current Connectors
 
 | Connector | Status | Registration | Notes |

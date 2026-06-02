@@ -13,13 +13,15 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 BENCHMARK_ROOT = REPO_ROOT / ".contextty" / "benchmarks"
-GENERATED_RUNS_MANIFEST = BENCHMARK_ROOT / ".generated-runs.json"
+BENCHMARK_RUNS_ROOT = BENCHMARK_ROOT / "runs"
+BENCHMARK_DATABASES_ROOT = BENCHMARK_ROOT / "databases"
+GENERATED_RUNS_MANIFEST = BENCHMARK_RUNS_ROOT / ".generated-runs.json"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -56,11 +58,22 @@ class QuestionSpec:
     expected_kind: ExpectedKind
 
 
+@dataclass(frozen=True)
+class BenchmarkSuite:
+    name: str
+    default_db_path: Path
+    source_name: str
+    questions: tuple[QuestionSpec, ...]
+    builder: Callable[[Path], None] | None = None
+
+
 @dataclass
 class SnapshotStats:
     store_path: str
     source_name: str
     db_path: str
+    source_db_size_bytes: int
+    contextty_db_size_bytes: int
     profile_mode: str
     row_limit: int
     nodes: int
@@ -375,28 +388,1328 @@ QUESTIONS: tuple[QuestionSpec, ...] = (
 )
 
 
-ANSWER_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["answers"],
-    "properties": {
-        "answers": {
-            "type": "array",
-            "minItems": len(QUESTIONS),
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["id", "answer", "source_used", "confidence"],
-                "properties": {
-                    "id": {"type": "string"},
-                    "answer": {"type": "string"},
-                    "source_used": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+COMMERCE_QUESTIONS: tuple[QuestionSpec, ...] = (
+    QuestionSpec(
+        id="Q01",
+        category="schema_profile",
+        question="How many user tables are in the commerce SQLite database, excluding sqlite internal tables?",
+        sql="""
+            SELECT count(*) AS value
+            FROM sqlite_schema
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+        """,
+        expected_kind="number",
+    ),
+    QuestionSpec(
+        id="Q02",
+        category="schema_profile",
+        question="Which table stores order line items with product quantities and unit prices?",
+        sql="""
+            SELECT name
+            FROM sqlite_schema
+            WHERE type = 'table'
+              AND sql LIKE '%quantity%'
+              AND sql LIKE '%unit_price_cents%'
+            ORDER BY name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q03",
+        category="schema_profile",
+        question="What columns make up the composite primary key for order_items?",
+        sql="""
+            SELECT name
+            FROM pragma_table_info('order_items')
+            WHERE pk > 0
+            ORDER BY pk
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q04",
+        category="schema_profile",
+        question="Which columns in support_tickets reference orders?",
+        sql="""
+            SELECT "from" AS column_name
+            FROM pragma_foreign_key_list('support_tickets')
+            WHERE "table" = 'orders'
+            ORDER BY column_name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q05",
+        category="schema_profile",
+        question="Which indexes are defined on orders for customer_id and status lookups?",
+        sql="""
+            SELECT DISTINCT il.name
+            FROM pragma_index_list('orders') AS il
+            JOIN pragma_index_info(il.name) AS ii
+            WHERE ii.name IN ('customer_id', 'status')
+            ORDER BY il.name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q06",
+        category="schema_profile",
+        question="What are the products.status values and counts?",
+        sql="""
+            SELECT status, count(*) AS count
+            FROM products
+            GROUP BY status
+            ORDER BY status
+        """,
+        expected_kind="mapping",
+    ),
+    QuestionSpec(
+        id="Q07",
+        category="schema_profile",
+        question="What are the orders.status values and counts?",
+        sql="""
+            SELECT status, count(*) AS count
+            FROM orders
+            GROUP BY status
+            ORDER BY status
+        """,
+        expected_kind="mapping",
+    ),
+    QuestionSpec(
+        id="Q08",
+        category="row_level",
+        question="Which category contains Noise Cancelling Headphones?",
+        sql="""
+            SELECT categories.name AS category_name
+            FROM products
+            JOIN categories ON categories.id = products.category_id
+            WHERE products.name = 'Noise Cancelling Headphones'
+        """,
+        expected_kind="value",
+    ),
+    QuestionSpec(
+        id="Q09",
+        category="row_level",
+        question="Which customer placed order WEB-1003?",
+        sql="""
+            SELECT customers.first_name || ' ' || customers.last_name AS customer_name
+            FROM orders
+            JOIN customers ON customers.id = orders.customer_id
+            WHERE orders.order_number = 'WEB-1003'
+        """,
+        expected_kind="value",
+    ),
+    QuestionSpec(
+        id="Q10",
+        category="row_level",
+        question="Which product has the highest total quantity sold, and what is the total quantity?",
+        sql="""
+            SELECT products.name AS product_name,
+                   sum(order_items.quantity) AS total_quantity
+            FROM order_items
+            JOIN products ON products.id = order_items.product_id
+            GROUP BY products.id, products.name
+            ORDER BY total_quantity DESC, products.name
+            LIMIT 1
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q11",
+        category="row_level",
+        question="Which orders did Ava Stone place, and what are their statuses?",
+        sql="""
+            SELECT orders.order_number, orders.status
+            FROM orders
+            JOIN customers ON customers.id = orders.customer_id
+            WHERE customers.first_name = 'Ava'
+              AND customers.last_name = 'Stone'
+            ORDER BY orders.order_number
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q12",
+        category="row_level",
+        question="What is the average order_items.quantity by product category?",
+        sql="""
+            SELECT categories.name AS category_name,
+                   round(avg(order_items.quantity), 2) AS average_quantity
+            FROM order_items
+            JOIN products ON products.id = order_items.product_id
+            JOIN categories ON categories.id = products.category_id
+            GROUP BY categories.name
+            ORDER BY categories.name
+        """,
+        expected_kind="mapping",
+    ),
+)
+
+
+FINANCE_QUESTIONS: tuple[QuestionSpec, ...] = (
+    QuestionSpec(
+        id="Q01",
+        category="schema_profile",
+        question="How many user tables are in the finance SQLite database, excluding sqlite internal tables?",
+        sql="""
+            SELECT count(*) AS value
+            FROM sqlite_schema
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+        """,
+        expected_kind="number",
+    ),
+    QuestionSpec(
+        id="Q02",
+        category="schema_profile",
+        question="Which table stores account transactions with vendors, categories, amounts, statuses, and posted dates?",
+        sql="""
+            SELECT name
+            FROM sqlite_schema
+            WHERE type = 'table'
+              AND sql LIKE '%vendor_id%'
+              AND sql LIKE '%category_id%'
+              AND sql LIKE '%amount_usd%'
+              AND sql LIKE '%posted_on%'
+            ORDER BY name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q03",
+        category="schema_profile",
+        question="What column is the primary key for transactions?",
+        sql="""
+            SELECT name
+            FROM pragma_table_info('transactions')
+            WHERE pk > 0
+            ORDER BY pk
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q04",
+        category="schema_profile",
+        question="Which columns in transactions reference accounts, vendors, and categories?",
+        sql="""
+            SELECT "from" AS column_name
+            FROM pragma_foreign_key_list('transactions')
+            WHERE "table" IN ('accounts', 'vendors', 'categories')
+            ORDER BY column_name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q05",
+        category="schema_profile",
+        question="Which indexes support transaction account/status lookups and reimbursement vendor/status lookups?",
+        sql="""
+            SELECT DISTINCT il.name
+            FROM sqlite_schema AS tables
+            JOIN pragma_index_list(tables.name) AS il
+            JOIN pragma_index_info(il.name) AS ii
+            WHERE tables.name IN ('transactions', 'reimbursements')
+              AND ii.name IN ('account_id', 'status', 'vendor_id')
+            ORDER BY il.name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q06",
+        category="schema_profile",
+        question="What are the transactions.status values and counts?",
+        sql="""
+            SELECT status, count(*) AS count
+            FROM transactions
+            GROUP BY status
+            ORDER BY status
+        """,
+        expected_kind="mapping",
+    ),
+    QuestionSpec(
+        id="Q07",
+        category="schema_profile",
+        question="What are the reimbursements.status values and counts?",
+        sql="""
+            SELECT status, count(*) AS count
+            FROM reimbursements
+            GROUP BY status
+            ORDER BY status
+        """,
+        expected_kind="mapping",
+    ),
+    QuestionSpec(
+        id="Q08",
+        category="row_level",
+        question="Which account holder and branch are linked to account ACC-1002?",
+        sql="""
+            SELECT account_holders.first_name || ' ' || account_holders.last_name AS account_holder,
+                   branches.name AS branch_name
+            FROM accounts
+            JOIN account_holders ON account_holders.id = accounts.holder_id
+            JOIN branches ON branches.id = accounts.branch_id
+            WHERE accounts.account_number = 'ACC-1002'
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q09",
+        category="row_level",
+        question="Which vendor and category are linked to transaction TXN-9006?",
+        sql="""
+            SELECT vendors.name AS vendor_name,
+                   categories.name AS category_name
+            FROM transactions
+            JOIN vendors ON vendors.id = transactions.vendor_id
+            JOIN categories ON categories.id = transactions.category_id
+            WHERE transactions.transaction_ref = 'TXN-9006'
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q10",
+        category="row_level",
+        question="Which vendor has the highest total transaction amount, and what is the total amount?",
+        sql="""
+            SELECT vendors.name AS vendor_name,
+                   round(sum(transactions.amount_usd), 2) AS total_amount_usd
+            FROM transactions
+            JOIN vendors ON vendors.id = transactions.vendor_id
+            GROUP BY vendors.id, vendors.name
+            ORDER BY total_amount_usd DESC, vendors.name
+            LIMIT 1
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q11",
+        category="row_level",
+        question="Which transactions belong to account ACC-1001, and what are their statuses?",
+        sql="""
+            SELECT transactions.transaction_ref,
+                   transactions.status
+            FROM transactions
+            JOIN accounts ON accounts.id = transactions.account_id
+            WHERE accounts.account_number = 'ACC-1001'
+            ORDER BY transactions.transaction_ref
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q12",
+        category="row_level",
+        question="What is the average transaction amount by branch?",
+        sql="""
+            SELECT branches.name AS branch_name,
+                   round(avg(transactions.amount_usd), 2) AS average_amount_usd
+            FROM transactions
+            JOIN accounts ON accounts.id = transactions.account_id
+            JOIN branches ON branches.id = accounts.branch_id
+            GROUP BY branches.name
+            ORDER BY branches.name
+        """,
+        expected_kind="mapping",
+    ),
+)
+
+
+EDUCATION_QUESTIONS: tuple[QuestionSpec, ...] = (
+    QuestionSpec(
+        id="Q01",
+        category="schema_profile",
+        question="How many user tables are in the education SQLite database, excluding sqlite internal tables?",
+        sql="""
+            SELECT count(*) AS value
+            FROM sqlite_schema
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+        """,
+        expected_kind="number",
+    ),
+    QuestionSpec(
+        id="Q02",
+        category="schema_profile",
+        question="Which table stores student section enrollments with statuses and grade points?",
+        sql="""
+            SELECT name
+            FROM sqlite_schema
+            WHERE type = 'table'
+              AND sql LIKE '%student_id%'
+              AND sql LIKE '%section_id%'
+              AND sql LIKE '%grade_points%'
+            ORDER BY name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q03",
+        category="schema_profile",
+        question="What columns make up the composite primary key for enrollments?",
+        sql="""
+            SELECT name
+            FROM pragma_table_info('enrollments')
+            WHERE pk > 0
+            ORDER BY pk
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q04",
+        category="schema_profile",
+        question="Which columns in sections reference courses and instructors?",
+        sql="""
+            SELECT "from" AS column_name
+            FROM pragma_foreign_key_list('sections')
+            WHERE "table" IN ('courses', 'instructors')
+            ORDER BY column_name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q05",
+        category="schema_profile",
+        question="Which indexes are defined on enrollments for status and section_id lookups?",
+        sql="""
+            SELECT DISTINCT il.name
+            FROM pragma_index_list('enrollments') AS il
+            JOIN pragma_index_info(il.name) AS ii
+            WHERE ii.name IN ('status', 'section_id')
+              AND il.origin != 'pk'
+            ORDER BY il.name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q06",
+        category="schema_profile",
+        question="What are the students.status values and counts?",
+        sql="""
+            SELECT status, count(*) AS count
+            FROM students
+            GROUP BY status
+            ORDER BY status
+        """,
+        expected_kind="mapping",
+    ),
+    QuestionSpec(
+        id="Q07",
+        category="schema_profile",
+        question="What are the sections.status values and counts?",
+        sql="""
+            SELECT status, count(*) AS count
+            FROM sections
+            GROUP BY status
+            ORDER BY status
+        """,
+        expected_kind="mapping",
+    ),
+    QuestionSpec(
+        id="Q08",
+        category="row_level",
+        question="Which department offers Data Ethics?",
+        sql="""
+            SELECT departments.name AS department_name
+            FROM courses
+            JOIN departments ON departments.id = courses.department_id
+            WHERE courses.title = 'Data Ethics'
+        """,
+        expected_kind="value",
+    ),
+    QuestionSpec(
+        id="Q09",
+        category="row_level",
+        question="Which instructor teaches section SEC-2025-FALL-DATA201-A?",
+        sql="""
+            SELECT instructors.first_name || ' ' || instructors.last_name AS instructor_name
+            FROM sections
+            JOIN instructors ON instructors.id = sections.instructor_id
+            WHERE sections.section_code = 'SEC-2025-FALL-DATA201-A'
+        """,
+        expected_kind="value",
+    ),
+    QuestionSpec(
+        id="Q10",
+        category="row_level",
+        question="Which section has the highest total enrollment grade points, and what is the total?",
+        sql="""
+            SELECT sections.section_code,
+                   round(sum(enrollments.grade_points), 2) AS total_grade_points
+            FROM enrollments
+            JOIN sections ON sections.id = enrollments.section_id
+            GROUP BY sections.id, sections.section_code
+            ORDER BY total_grade_points DESC, sections.section_code
+            LIMIT 1
+        """,
+        expected_kind="rows",
+    ),
+    QuestionSpec(
+        id="Q11",
+        category="row_level",
+        question="Which students are enrolled in section SEC-2025-FALL-DATA201-A?",
+        sql="""
+            SELECT students.first_name || ' ' || students.last_name AS student_name
+            FROM enrollments
+            JOIN students ON students.id = enrollments.student_id
+            JOIN sections ON sections.id = enrollments.section_id
+            WHERE sections.section_code = 'SEC-2025-FALL-DATA201-A'
+              AND enrollments.status = 'enrolled'
+            ORDER BY students.last_name, students.first_name
+        """,
+        expected_kind="list",
+    ),
+    QuestionSpec(
+        id="Q12",
+        category="row_level",
+        question="What is the average enrollment grade points by course?",
+        sql="""
+            SELECT courses.title AS course_title,
+                   round(avg(enrollments.grade_points), 2) AS average_grade_points
+            FROM enrollments
+            JOIN sections ON sections.id = enrollments.section_id
+            JOIN courses ON courses.id = sections.course_id
+            WHERE enrollments.grade_points IS NOT NULL
+            GROUP BY courses.title
+            ORDER BY courses.title
+        """,
+        expected_kind="mapping",
+    ),
+)
+
+
+def answer_schema_for(questions: tuple[QuestionSpec, ...]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["answers"],
+        "properties": {
+            "answers": {
+                "type": "array",
+                "minItems": len(questions),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["id", "answer", "source_used", "confidence"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "source_used": {"type": "string"},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
                 },
-            },
-        }
-    },
+            }
+        },
+    }
+
+
+ANSWER_SCHEMA: dict[str, Any] = answer_schema_for(QUESTIONS)
+
+
+def create_hr_fixture_db(db_path: Path) -> None:
+    db_path = db_path.expanduser().resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(
+            """
+            CREATE TABLE office_locations (
+                id INTEGER PRIMARY KEY,
+                city TEXT NOT NULL,
+                state TEXT NOT NULL,
+                country TEXT NOT NULL,
+                opened_on TEXT NOT NULL
+            );
+
+            CREATE TABLE departments (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                cost_center TEXT NOT NULL UNIQUE,
+                office_location_id INTEGER NOT NULL REFERENCES office_locations(id)
+            );
+
+            CREATE TABLE job_titles (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL UNIQUE,
+                level TEXT NOT NULL,
+                salary_band_min INTEGER NOT NULL,
+                salary_band_max INTEGER NOT NULL
+            );
+
+            CREATE TABLE employees (
+                id INTEGER PRIMARY KEY,
+                employee_number TEXT NOT NULL UNIQUE,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                department_id INTEGER NOT NULL REFERENCES departments(id),
+                job_title_id INTEGER NOT NULL REFERENCES job_titles(id),
+                manager_id INTEGER REFERENCES employees(id),
+                employment_status TEXT NOT NULL CHECK (employment_status IN ('active', 'on_leave', 'terminated')),
+                hire_date TEXT NOT NULL,
+                termination_date TEXT
+            );
+
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                department_id INTEGER NOT NULL REFERENCES departments(id),
+                status TEXT NOT NULL CHECK (status IN ('planning', 'active', 'paused', 'complete')),
+                started_on TEXT NOT NULL,
+                target_end_on TEXT
+            );
+
+            CREATE TABLE employee_projects (
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                role TEXT NOT NULL,
+                allocation_percent INTEGER NOT NULL CHECK (allocation_percent BETWEEN 1 AND 100),
+                assigned_on TEXT NOT NULL,
+                PRIMARY KEY (employee_id, project_id)
+            );
+
+            CREATE TABLE salary_history (
+                id INTEGER PRIMARY KEY,
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                effective_date TEXT NOT NULL,
+                salary INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                reason TEXT NOT NULL,
+                UNIQUE (employee_id, effective_date)
+            );
+
+            CREATE TABLE performance_reviews (
+                id INTEGER PRIMARY KEY,
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                reviewer_id INTEGER NOT NULL REFERENCES employees(id),
+                review_period TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                summary TEXT NOT NULL,
+                completed_on TEXT NOT NULL,
+                UNIQUE (employee_id, review_period)
+            );
+
+            CREATE TABLE time_off_requests (
+                id INTEGER PRIMARY KEY,
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                request_type TEXT NOT NULL CHECK (request_type IN ('vacation', 'sick', 'parental', 'bereavement', 'unpaid')),
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'cancelled')),
+                approver_id INTEGER REFERENCES employees(id),
+                submitted_on TEXT NOT NULL
+            );
+
+            CREATE INDEX idx_employee_projects_project ON employee_projects(project_id);
+            CREATE INDEX idx_employees_department ON employees(department_id);
+            CREATE INDEX idx_employees_manager ON employees(manager_id);
+            CREATE INDEX idx_reviews_employee ON performance_reviews(employee_id, review_period);
+            CREATE INDEX idx_salary_history_employee ON salary_history(employee_id, effective_date);
+            CREATE INDEX idx_time_off_employee ON time_off_requests(employee_id, start_date);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO office_locations(id, city, state, country, opened_on) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "Seattle", "WA", "USA", "2018-04-15"),
+                (2, "Austin", "TX", "USA", "2020-09-01"),
+                (3, "New York", "NY", "USA", "2021-02-10"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO departments(id, name, cost_center, office_location_id) VALUES (?, ?, ?, ?)",
+            [
+                (1, "Engineering", "ENG-100", 1),
+                (2, "Product", "PRD-200", 3),
+                (3, "Sales", "SAL-300", 2),
+                (4, "People Operations", "POP-400", 1),
+                (5, "Finance", "FIN-500", 3),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO job_titles(id, title, level, salary_band_min, salary_band_max)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "Chief Operating Officer", "Executive", 210000, 290000),
+                (2, "Engineering Manager", "M5", 165000, 215000),
+                (3, "Senior Software Engineer", "IC4", 135000, 180000),
+                (4, "Software Engineer", "IC3", 105000, 145000),
+                (5, "Product Manager", "IC4", 130000, 175000),
+                (6, "Account Executive", "IC3", 90000, 140000),
+                (7, "HR Business Partner", "IC3", 95000, 130000),
+                (8, "Financial Analyst", "IC2", 80000, 110000),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO employees(
+                id,
+                employee_number,
+                first_name,
+                last_name,
+                email,
+                department_id,
+                job_title_id,
+                manager_id,
+                employment_status,
+                hire_date,
+                termination_date
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "E-1001", "Maya", "Chen", "maya.chen@example.com", 4, 1, None, "active", "2019-01-07", None),
+                (
+                    2,
+                    "E-1002",
+                    "Luis",
+                    "Martinez",
+                    "luis.martinez@example.com",
+                    1,
+                    2,
+                    1,
+                    "active",
+                    "2020-03-16",
+                    None,
+                ),
+                (3, "E-1003", "Priya", "Nair", "priya.nair@example.com", 1, 3, 2, "active", "2021-06-21", None),
+                (4, "E-1004", "Owen", "Brooks", "owen.brooks@example.com", 1, 4, 2, "active", "2022-10-03", None),
+                (
+                    5,
+                    "E-1005",
+                    "Aisha",
+                    "Johnson",
+                    "aisha.johnson@example.com",
+                    2,
+                    5,
+                    1,
+                    "active",
+                    "2021-04-12",
+                    None,
+                ),
+                (6, "E-1006", "Noah", "Kim", "noah.kim@example.com", 3, 6, 1, "active", "2022-01-24", None),
+                (
+                    7,
+                    "E-1007",
+                    "Elena",
+                    "Garcia",
+                    "elena.garcia@example.com",
+                    4,
+                    7,
+                    1,
+                    "on_leave",
+                    "2020-11-09",
+                    None,
+                ),
+                (8, "E-1008", "Marcus", "Reed", "marcus.reed@example.com", 5, 8, 1, "active", "2023-02-13", None),
+                (
+                    9,
+                    "E-1009",
+                    "Hannah",
+                    "Wright",
+                    "hannah.wright@example.com",
+                    3,
+                    6,
+                    6,
+                    "terminated",
+                    "2021-08-02",
+                    "2025-12-15",
+                ),
+                (10, "E-1010", "Samir", "Patel", "samir.patel@example.com", 1, 3, 2, "active", "2023-07-17", None),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO projects(id, name, department_id, status, started_on, target_end_on)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "Payroll Modernization", 5, "active", "2025-10-01", "2026-06-30"),
+                (2, "Employee Self Service Portal", 1, "active", "2025-11-15", "2026-05-31"),
+                (3, "Compensation Benchmark Refresh", 4, "planning", "2026-02-01", "2026-04-30"),
+                (4, "Enterprise Expansion Campaign", 3, "active", "2026-01-05", "2026-09-30"),
+                (5, "Manager Insights Dashboard", 2, "active", "2025-12-01", "2026-07-15"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO employee_projects(employee_id, project_id, role, allocation_percent, assigned_on)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (2, 2, "sponsor", 20, "2025-11-15"),
+                (3, 2, "tech_lead", 70, "2025-11-15"),
+                (3, 5, "data_partner", 25, "2025-12-08"),
+                (4, 2, "engineer", 80, "2025-11-20"),
+                (5, 5, "product_owner", 60, "2025-12-01"),
+                (6, 4, "sales_owner", 75, "2026-01-05"),
+                (7, 3, "people_ops_owner", 30, "2026-02-01"),
+                (8, 1, "finance_owner", 50, "2025-10-01"),
+                (10, 2, "engineer", 60, "2025-12-01"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO salary_history(id, employee_id, effective_date, salary, currency, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "2025-01-01", 245000, "USD", "annual_adjustment"),
+                (2, 2, "2025-01-01", 188000, "USD", "annual_adjustment"),
+                (3, 3, "2025-01-01", 158000, "USD", "annual_adjustment"),
+                (4, 4, "2025-01-01", 122000, "USD", "annual_adjustment"),
+                (5, 5, "2025-01-01", 151000, "USD", "annual_adjustment"),
+                (6, 6, "2025-01-01", 118000, "USD", "annual_adjustment"),
+                (7, 7, "2025-01-01", 112000, "USD", "annual_adjustment"),
+                (8, 8, "2025-01-01", 93000, "USD", "annual_adjustment"),
+                (9, 9, "2025-01-01", 101000, "USD", "annual_adjustment"),
+                (10, 10, "2025-01-01", 146000, "USD", "annual_adjustment"),
+                (11, 10, "2026-01-01", 154000, "USD", "promotion"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO performance_reviews(
+                id,
+                employee_id,
+                reviewer_id,
+                review_period,
+                rating,
+                summary,
+                completed_on
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 2, 1, "2025-H2", 5, "Exceeded delivery and retention goals.", "2026-01-12"),
+                (2, 3, 2, "2025-H2", 4, "Strong technical leadership on platform reliability.", "2026-01-14"),
+                (3, 4, 2, "2025-H2", 3, "Delivered committed scope and is growing design ownership.", "2026-01-15"),
+                (4, 5, 1, "2025-H2", 4, "Improved roadmap clarity and launch readiness.", "2026-01-13"),
+                (5, 6, 1, "2025-H2", 4, "Expanded enterprise pipeline and improved forecast hygiene.", "2026-01-16"),
+                (6, 8, 1, "2025-H2", 3, "Accurate reporting with opportunities to automate close tasks.", "2026-01-17"),
+                (7, 10, 2, "2025-H2", 5, "Led migration work and mentored peers effectively.", "2026-01-15"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO time_off_requests(
+                id,
+                employee_id,
+                request_type,
+                start_date,
+                end_date,
+                status,
+                approver_id,
+                submitted_on
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 3, "vacation", "2026-03-18", "2026-03-22", "approved", 2, "2026-01-20"),
+                (2, 4, "sick", "2026-02-04", "2026-02-05", "approved", 2, "2026-02-04"),
+                (3, 7, "parental", "2026-01-15", "2026-04-15", "approved", 1, "2025-12-01"),
+                (4, 6, "vacation", "2026-05-11", "2026-05-15", "pending", 1, "2026-02-19"),
+                (5, 10, "vacation", "2026-04-06", "2026-04-10", "approved", 2, "2026-02-10"),
+            ],
+        )
+
+
+def create_commerce_fixture_db(db_path: Path) -> None:
+    db_path = db_path.expanduser().resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(
+            """
+            CREATE TABLE customers (
+                id INTEGER PRIMARY KEY,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                signup_date TEXT NOT NULL
+            );
+
+            CREATE TABLE categories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                sku TEXT NOT NULL UNIQUE,
+                category_id INTEGER NOT NULL REFERENCES categories(id),
+                status TEXT NOT NULL,
+                unit_price_cents INTEGER NOT NULL
+            );
+
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                order_number TEXT NOT NULL UNIQUE,
+                customer_id INTEGER NOT NULL REFERENCES customers(id),
+                status TEXT NOT NULL,
+                ordered_on TEXT NOT NULL
+            );
+
+            CREATE TABLE order_items (
+                order_id INTEGER NOT NULL REFERENCES orders(id),
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                quantity INTEGER NOT NULL,
+                unit_price_cents INTEGER NOT NULL,
+                PRIMARY KEY (order_id, product_id)
+            );
+
+            CREATE TABLE shipments (
+                id INTEGER PRIMARY KEY,
+                order_id INTEGER NOT NULL REFERENCES orders(id),
+                carrier TEXT NOT NULL,
+                status TEXT NOT NULL,
+                shipped_on TEXT NOT NULL,
+                delivered_on TEXT
+            );
+
+            CREATE TABLE support_tickets (
+                id INTEGER PRIMARY KEY,
+                customer_id INTEGER NOT NULL REFERENCES customers(id),
+                order_id INTEGER REFERENCES orders(id),
+                priority TEXT NOT NULL,
+                status TEXT NOT NULL,
+                opened_on TEXT NOT NULL,
+                closed_on TEXT
+            );
+
+            CREATE INDEX idx_orders_customer ON orders(customer_id);
+            CREATE INDEX idx_orders_status ON orders(status);
+            CREATE INDEX idx_order_items_product ON order_items(product_id);
+            CREATE INDEX idx_shipments_order ON shipments(order_id);
+            CREATE INDEX idx_tickets_customer ON support_tickets(customer_id);
+            CREATE INDEX idx_tickets_order ON support_tickets(order_id);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO customers(id, first_name, last_name, email, status, signup_date) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, "Ava", "Stone", "ava.stone@example.com", "active", "2024-01-10"),
+                (2, "Liam", "Chen", "liam.chen@example.com", "active", "2024-02-20"),
+                (3, "Nora", "Diaz", "nora.diaz@example.com", "churned", "2023-11-05"),
+                (4, "Omar", "Reed", "omar.reed@example.com", "active", "2024-05-14"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO categories(id, name) VALUES (?, ?)",
+            [(1, "Audio"), (2, "Kitchen"), (3, "Outdoor")],
+        )
+        conn.executemany(
+            "INSERT INTO products(id, name, sku, category_id, status, unit_price_cents) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, "Noise Cancelling Headphones", "AUD-HEAD-100", 1, "active", 19900),
+                (2, "Espresso Grinder", "KIT-GRIND-200", 2, "active", 8900),
+                (3, "Camping Lantern", "OUT-LAMP-300", 3, "discontinued", 3500),
+                (4, "Smart Speaker", "AUD-SPKR-400", 1, "active", 12900),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO orders(id, order_number, customer_id, status, ordered_on) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "WEB-1001", 1, "shipped", "2025-11-01"),
+                (2, "WEB-1002", 2, "delivered", "2025-11-05"),
+                (3, "WEB-1003", 1, "processing", "2025-12-03"),
+                (4, "WEB-1004", 4, "delivered", "2025-12-10"),
+                (5, "WEB-1005", 3, "cancelled", "2025-12-12"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO order_items(order_id, product_id, quantity, unit_price_cents) VALUES (?, ?, ?, ?)",
+            [
+                (1, 1, 1, 19900),
+                (1, 2, 1, 8900),
+                (2, 4, 2, 12900),
+                (2, 3, 2, 3500),
+                (3, 1, 3, 19900),
+                (4, 2, 1, 8900),
+                (4, 4, 1, 12900),
+                (5, 3, 1, 3500),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO shipments(id, order_id, carrier, status, shipped_on, delivered_on) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (1, 1, "UPS", "delivered", "2025-11-02", "2025-11-05"),
+                (2, 2, "FedEx", "delivered", "2025-11-06", "2025-11-09"),
+                (3, 3, "UPS", "in_transit", "2025-12-04", None),
+                (4, 4, "DHL", "delivered", "2025-12-11", "2025-12-14"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO support_tickets(id, customer_id, order_id, priority, status, opened_on, closed_on)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, 3, "high", "open", "2025-12-04", None),
+                (2, 2, 2, "low", "closed", "2025-11-10", "2025-11-12"),
+                (3, 3, 5, "medium", "closed", "2025-12-13", "2025-12-15"),
+            ],
+        )
+
+
+def create_finance_fixture_db(db_path: Path) -> None:
+    db_path = db_path.expanduser().resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(
+            """
+            CREATE TABLE branches (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                region TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE account_holders (
+                id INTEGER PRIMARY KEY,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                account_number TEXT NOT NULL UNIQUE,
+                holder_id INTEGER NOT NULL REFERENCES account_holders(id),
+                branch_id INTEGER NOT NULL REFERENCES branches(id),
+                account_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                opened_on TEXT NOT NULL
+            );
+
+            CREATE TABLE vendors (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                merchant_code TEXT NOT NULL UNIQUE,
+                risk_category TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE categories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                category_type TEXT NOT NULL
+            );
+
+            CREATE TABLE transactions (
+                id INTEGER PRIMARY KEY,
+                transaction_ref TEXT NOT NULL UNIQUE,
+                account_id INTEGER NOT NULL REFERENCES accounts(id),
+                vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                category_id INTEGER NOT NULL REFERENCES categories(id),
+                amount_usd REAL NOT NULL,
+                status TEXT NOT NULL,
+                posted_on TEXT NOT NULL
+            );
+
+            CREATE TABLE reimbursements (
+                id INTEGER PRIMARY KEY,
+                reimbursement_ref TEXT NOT NULL UNIQUE,
+                account_id INTEGER NOT NULL REFERENCES accounts(id),
+                vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                amount_usd REAL NOT NULL,
+                status TEXT NOT NULL,
+                submitted_on TEXT NOT NULL,
+                approved_on TEXT
+            );
+
+            CREATE INDEX idx_transactions_account ON transactions(account_id);
+            CREATE INDEX idx_transactions_status ON transactions(status);
+            CREATE INDEX idx_reimbursements_vendor ON reimbursements(vendor_id);
+            CREATE INDEX idx_reimbursements_status ON reimbursements(status);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO branches(id, name, region, status) VALUES (?, ?, ?, ?)",
+            [
+                (1, "North Loop", "West", "active"),
+                (2, "Lakeview", "Central", "active"),
+                (3, "Harbor", "East", "active"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO account_holders(id, first_name, last_name, risk_level, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "Mia", "Torres", "standard", "active"),
+                (2, "Ethan", "Brooks", "premium", "active"),
+                (3, "Zoe", "Kim", "standard", "review"),
+                (4, "Aaron", "Price", "premium", "active"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO accounts(id, account_number, holder_id, branch_id, account_type, status, opened_on)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "ACC-1001", 1, 1, "checking", "open", "2024-01-05"),
+                (2, "ACC-1002", 2, 2, "savings", "open", "2024-02-14"),
+                (3, "ACC-1003", 3, 3, "credit", "open", "2024-03-18"),
+                (4, "ACC-1004", 4, 1, "checking", "closed", "2023-09-22"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO vendors(id, name, merchant_code, risk_category, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "Green Valley Utilities", "VEND-UTIL", "low", "active"),
+                (2, "Metro Office Supply", "VEND-OFF", "low", "active"),
+                (3, "Coastline Travel", "VEND-TRV", "medium", "active"),
+                (4, "Northstar Medical", "VEND-MED", "high", "review"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO categories(id, name, category_type) VALUES (?, ?, ?)",
+            [
+                (1, "Utilities", "operating"),
+                (2, "Office Supplies", "operating"),
+                (3, "Travel", "discretionary"),
+                (4, "Healthcare", "benefit"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO transactions(id, transaction_ref, account_id, vendor_id, category_id, amount_usd, status, posted_on)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "TXN-9001", 1, 1, 1, 120.50, "posted", "2025-10-01"),
+                (2, "TXN-9002", 1, 2, 2, 340.00, "pending", "2025-10-03"),
+                (3, "TXN-9003", 2, 3, 3, 920.75, "posted", "2025-10-04"),
+                (4, "TXN-9004", 2, 2, 2, 215.25, "posted", "2025-10-05"),
+                (5, "TXN-9005", 3, 4, 4, 480.00, "disputed", "2025-10-06"),
+                (6, "TXN-9006", 4, 3, 3, 1300.00, "posted", "2025-10-08"),
+                (7, "TXN-9007", 1, 3, 3, 75.00, "posted", "2025-10-10"),
+                (8, "TXN-9008", 3, 1, 1, 60.25, "pending", "2025-10-12"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO reimbursements(id, reimbursement_ref, account_id, vendor_id, amount_usd, status, submitted_on, approved_on)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "RMB-7001", 1, 2, 120.00, "approved", "2025-10-11", "2025-10-13"),
+                (2, "RMB-7002", 2, 3, 400.00, "submitted", "2025-10-15", None),
+                (3, "RMB-7003", 3, 4, 250.50, "rejected", "2025-10-18", None),
+                (4, "RMB-7004", 1, 1, 45.00, "approved", "2025-10-20", "2025-10-22"),
+            ],
+        )
+
+
+def create_education_fixture_db(db_path: Path) -> None:
+    db_path = db_path.expanduser().resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(
+            """
+            CREATE TABLE campuses (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                city TEXT NOT NULL,
+                state TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE departments (
+                id INTEGER PRIMARY KEY,
+                campus_id INTEGER NOT NULL REFERENCES campuses(id),
+                name TEXT NOT NULL UNIQUE,
+                code TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE instructors (
+                id INTEGER PRIMARY KEY,
+                department_id INTEGER NOT NULL REFERENCES departments(id),
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                rank TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE students (
+                id INTEGER PRIMARY KEY,
+                student_number TEXT NOT NULL UNIQUE,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                program_level TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE courses (
+                id INTEGER PRIMARY KEY,
+                department_id INTEGER NOT NULL REFERENCES departments(id),
+                course_code TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL UNIQUE,
+                credits INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
+
+            CREATE TABLE sections (
+                id INTEGER PRIMARY KEY,
+                section_code TEXT NOT NULL UNIQUE,
+                course_id INTEGER NOT NULL REFERENCES courses(id),
+                instructor_id INTEGER NOT NULL REFERENCES instructors(id),
+                term TEXT NOT NULL,
+                status TEXT NOT NULL,
+                capacity INTEGER NOT NULL
+            );
+
+            CREATE TABLE enrollments (
+                student_id INTEGER NOT NULL REFERENCES students(id),
+                section_id INTEGER NOT NULL REFERENCES sections(id),
+                enrolled_on TEXT NOT NULL,
+                status TEXT NOT NULL,
+                grade_points REAL,
+                PRIMARY KEY (student_id, section_id)
+            );
+
+            CREATE INDEX idx_enrollments_status ON enrollments(status);
+            CREATE INDEX idx_enrollments_section ON enrollments(section_id);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO campuses(id, name, city, state, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, "North Campus", "Portland", "OR", "active"),
+                (2, "River Campus", "Salem", "OR", "active"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO departments(id, campus_id, name, code, status) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, 1, "Applied Analytics", "AA", "active"),
+                (2, 1, "Digital Humanities", "DH", "active"),
+                (3, 2, "Environmental Studies", "ES", "active"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO instructors(id, department_id, first_name, last_name, rank, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "Grace", "Lin", "associate", "active"),
+                (2, 2, "Henry", "Okafor", "lecturer", "active"),
+                (3, 3, "Imani", "Shah", "professor", "sabbatical"),
+                (4, 1, "Marco", "Ruiz", "assistant", "active"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO students(id, student_number, first_name, last_name, program_level, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "STU-1001", "Olivia", "Hart", "graduate", "active"),
+                (2, "STU-1002", "Noah", "Singh", "undergraduate", "active"),
+                (3, "STU-1003", "Emma", "Reyes", "graduate", "active"),
+                (4, "STU-1004", "Lucas", "Meyer", "undergraduate", "inactive"),
+                (5, "STU-1005", "Sophia", "Chen", "graduate", "active"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO courses(id, department_id, course_code, title, credits, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "DATA-201", "Data Ethics", 3, "active"),
+                (2, 2, "HUM-110", "Narrative Design", 4, "active"),
+                (3, 3, "ENV-305", "Climate Policy", 3, "active"),
+                (4, 1, "DATA-310", "Predictive Modeling", 4, "active"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO sections(id, section_code, course_id, instructor_id, term, status, capacity)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "SEC-2025-FALL-DATA201-A", 1, 1, "2025-FALL", "open", 30),
+                (2, "SEC-2025-FALL-HUM110-A", 2, 2, "2025-FALL", "open", 25),
+                (3, "SEC-2025-FALL-ENV305-A", 3, 3, "2025-FALL", "waitlist", 20),
+                (4, "SEC-2025-FALL-DATA310-A", 4, 4, "2025-FALL", "open", 28),
+                (5, "SEC-2026-SPRING-DATA201-B", 1, 4, "2026-SPRING", "cancelled", 30),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO enrollments(student_id, section_id, enrolled_on, status, grade_points)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (1, 1, "2025-08-20", "enrolled", 3.7),
+                (2, 1, "2025-08-20", "enrolled", 3.2),
+                (3, 1, "2025-08-21", "withdrawn", None),
+                (5, 1, "2025-08-22", "enrolled", 3.9),
+                (2, 2, "2025-08-20", "enrolled", 3.1),
+                (4, 2, "2025-08-21", "completed", 2.8),
+                (3, 3, "2025-08-20", "enrolled", 3.5),
+                (5, 3, "2025-08-22", "waitlisted", None),
+                (1, 4, "2025-08-19", "enrolled", 3.8),
+                (3, 4, "2025-08-19", "enrolled", 4.0),
+                (5, 4, "2025-08-20", "enrolled", 3.6),
+            ],
+        )
+
+
+BENCHMARK_SUITES: dict[str, BenchmarkSuite] = {
+    "hr": BenchmarkSuite(
+        name="hr",
+        default_db_path=BENCHMARK_DATABASES_ROOT / "contextty_test.db",
+        source_name="contextty-test",
+        questions=QUESTIONS,
+        builder=create_hr_fixture_db,
+    ),
+    "commerce": BenchmarkSuite(
+        name="commerce",
+        default_db_path=BENCHMARK_DATABASES_ROOT / "contextty_commerce.db",
+        source_name="contextty-commerce",
+        questions=COMMERCE_QUESTIONS,
+        builder=create_commerce_fixture_db,
+    ),
+    "finance": BenchmarkSuite(
+        name="finance",
+        default_db_path=BENCHMARK_DATABASES_ROOT / "contextty_finance.db",
+        source_name="contextty-finance",
+        questions=FINANCE_QUESTIONS,
+        builder=create_finance_fixture_db,
+    ),
+    "education": BenchmarkSuite(
+        name="education",
+        default_db_path=BENCHMARK_DATABASES_ROOT / "contextty_education.db",
+        source_name="contextty-education",
+        questions=EDUCATION_QUESTIONS,
+        builder=create_education_fixture_db,
+    ),
 }
+
+
+def ensure_suite_database(suite: BenchmarkSuite, db_path: Path, rebuild: bool = False) -> None:
+    if suite.builder is None:
+        return
+    if rebuild or not db_path.exists():
+        suite.builder(db_path)
 
 
 def readonly_sqlite_connection(db_path: Path | str, timeout_seconds: float = 5.0) -> sqlite3.Connection:
@@ -479,6 +1792,8 @@ def setup_contextty_snapshot(
         store_path=str(store_path),
         source_name=source_name,
         db_path=str(Path(db_path).expanduser().resolve()),
+        source_db_size_bytes=file_size_bytes(db_path),
+        contextty_db_size_bytes=file_size_bytes(store_path),
         profile_mode="deep",
         row_limit=row_limit,
         nodes=int(snapshot.get("nodes") or 0),
@@ -487,6 +1802,13 @@ def setup_contextty_snapshot(
         facts=int(snapshot.get("facts") or 0),
         snapshot_run_id=run.get("id"),
     )
+
+
+def file_size_bytes(path: Path | str) -> int:
+    try:
+        return Path(path).expanduser().resolve().stat().st_size
+    except OSError:
+        return 0
 
 
 def build_prompt(lane: LaneName, db_path: Path | str, source_name: str, questions: tuple[QuestionSpec, ...] = QUESTIONS) -> str:
@@ -977,12 +2299,13 @@ def run_codex_lane(
     store_path: Path,
     output_dir: Path,
     ground_truth: dict[str, dict[str, Any]],
+    questions: tuple[QuestionSpec, ...],
     schema_path: Path,
     codex_timeout_seconds: float,
 ) -> LaneResult:
     lane_dir = output_dir / lane
     lane_dir.mkdir(parents=True, exist_ok=True)
-    prompt = build_prompt(lane, db_path, source_name)
+    prompt = build_prompt(lane, db_path, source_name, questions=questions)
     prompt_path = lane_dir / "prompt.md"
     raw_jsonl_path = lane_dir / "codex.jsonl"
     final_answer_path = lane_dir / "final_answer.txt"
@@ -1153,11 +2476,13 @@ def build_report_markdown(
         [
             "## Snapshot",
             "",
-            "| store | source | profile | row limit | nodes | edges | pills | facts |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            "| store | source DB | source | profile | row limit | source DB size | Contextty DB size | nodes | edges | pills | facts |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             (
-                f"| `{snapshot.store_path}` | `{snapshot.source_name}` | {snapshot.profile_mode} | "
-                f"{snapshot.row_limit} | {snapshot.nodes} | {snapshot.edges} | {snapshot.pills} | {snapshot.facts} |"
+                f"| `{snapshot.store_path}` | `{snapshot.db_path}` | `{snapshot.source_name}` | {snapshot.profile_mode} | "
+                f"{snapshot.row_limit} | {fmt_bytes(snapshot.source_db_size_bytes)} | "
+                f"{fmt_bytes(snapshot.contextty_db_size_bytes)} | {snapshot.nodes} | {snapshot.edges} | "
+                f"{snapshot.pills} | {snapshot.facts} |"
             ),
             "",
         ]
@@ -1307,6 +2632,21 @@ def fmt_int(value: int | None) -> str:
     return "" if value is None else str(value)
 
 
+def fmt_bytes(value: int | None) -> str:
+    if value is None:
+        return ""
+    units = ["bytes", "KiB", "MiB", "GiB"]
+    rendered = float(value)
+    unit = units[0]
+    for unit in units:
+        if abs(rendered) < 1024 or unit == units[-1]:
+            break
+        rendered /= 1024
+    if unit == "bytes":
+        return f"{value} bytes"
+    return f"{rendered:.1f} {unit} ({value} bytes)"
+
+
 def fmt_seconds(ms: int | None) -> str:
     if ms is None:
         return ""
@@ -1352,6 +2692,8 @@ def build_strategy_results(snapshot: SnapshotStats, results: dict[str, LaneResul
             "pills": snapshot.pills,
             "facts": snapshot.facts,
             "row_limit": snapshot.row_limit,
+            "source_db_size_bytes": snapshot.source_db_size_bytes,
+            "contextty_db_size_bytes": snapshot.contextty_db_size_bytes,
         },
         "lanes": {lane: lane_summary(result) for lane, result in results.items()},
         "hybrid_vs_direct": {
@@ -1379,16 +2721,17 @@ def parse_lanes(raw: str) -> list[LaneName]:
 
 def default_output_dir() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return BENCHMARK_ROOT / timestamp
+    return BENCHMARK_RUNS_ROOT / timestamp
 
 
 def cleanup_generated_benchmark_artifacts(
     latest_output_dir: Path,
     keep_latest: int = 1,
+    keep_latest_partial: int = 1,
     manifest_path: Path = GENERATED_RUNS_MANIFEST,
 ) -> list[Path]:
-    if keep_latest < 1:
-        return []
+    keep_latest = max(0, keep_latest)
+    keep_latest_partial = max(0, keep_latest_partial)
 
     benchmark_root = manifest_path.parent.resolve()
     latest_output_dir = latest_output_dir.resolve()
@@ -1402,9 +2745,11 @@ def cleanup_generated_benchmark_artifacts(
         key=lambda path: (path.stat().st_mtime, path.name),
         reverse=True,
     )
-    keep = set(existing[:keep_latest])
+    full_runs = [path for path in existing if is_full_benchmark_run(path)]
+    partial_runs = [path for path in existing if path not in full_runs]
+    keep = set(full_runs[:keep_latest]) | set(partial_runs[:keep_latest_partial]) | {latest_output_dir}
     removed: list[Path] = []
-    for path in existing[keep_latest:]:
+    for path in existing:
         if path == latest_output_dir or path in keep:
             continue
         shutil.rmtree(path)
@@ -1416,6 +2761,20 @@ def cleanup_generated_benchmark_artifacts(
         encoding="utf-8",
     )
     return removed
+
+
+def is_full_benchmark_run(path: Path) -> bool:
+    report_path = path / "report.json"
+    if not report_path.exists():
+        return False
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    lanes = report.get("lanes")
+    if not isinstance(lanes, dict):
+        return False
+    return set(lanes) == set(VALID_LANES)
 
 
 def read_generated_runs_manifest(manifest_path: Path = GENERATED_RUNS_MANIFEST) -> list[Path]:
@@ -1432,9 +2791,15 @@ def read_generated_runs_manifest(manifest_path: Path = GENERATED_RUNS_MANIFEST) 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a local Contextty accuracy benchmark with Codex lanes.")
-    parser.add_argument("--db-path", type=Path, default=REPO_ROOT / ".test" / "contextty_test.db")
+    parser.add_argument("--suite", choices=sorted(BENCHMARK_SUITES), default="hr")
+    parser.add_argument("--db-path", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--source-name", default="contextty-test")
+    parser.add_argument("--source-name", default=None)
+    parser.add_argument(
+        "--rebuild-suite-db",
+        action="store_true",
+        help="Recreate generated fixture databases for suites that provide a local database builder.",
+    )
     parser.add_argument("--row-limit", type=int, default=1000)
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument("--codex-timeout", type=float, default=600.0)
@@ -1446,29 +2811,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Keep this many benchmark runs produced by this script and remove older generated runs.",
     )
+    parser.add_argument(
+        "--keep-latest-partial-artifacts",
+        type=int,
+        default=1,
+        help="Keep this many generated partial or failed benchmark runs and remove older generated partials.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    suite = BENCHMARK_SUITES[args.suite]
     output_dir = (args.output_dir or default_output_dir()).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    db_path = args.db_path.expanduser().resolve()
+    db_path = (args.db_path or suite.default_db_path).expanduser().resolve()
+    source_name = args.source_name or suite.source_name
+    ensure_suite_database(suite, db_path, rebuild=args.rebuild_suite_db)
     if not db_path.exists():
         print(f"database not found: {db_path}", file=sys.stderr)
         return 2
 
     model = args.model or read_default_codex_model()
     schema_path = output_dir / "answer_schema.json"
-    schema_path.write_text(json.dumps(ANSWER_SCHEMA, indent=2, sort_keys=True), encoding="utf-8")
+    schema_path.write_text(json.dumps(answer_schema_for(suite.questions), indent=2, sort_keys=True), encoding="utf-8")
 
-    ground_truth = compute_ground_truth(db_path)
+    ground_truth = compute_ground_truth(db_path, questions=suite.questions)
     (output_dir / "ground_truth.json").write_text(json.dumps(ground_truth, indent=2, sort_keys=True), encoding="utf-8")
 
     snapshot = setup_contextty_snapshot(
         db_path=db_path,
         output_dir=output_dir,
-        source_name=args.source_name,
+        source_name=source_name,
         row_limit=args.row_limit,
     )
     store_path = Path(snapshot.store_path)
@@ -1481,10 +2855,11 @@ def main(argv: list[str] | None = None) -> int:
             codex_bin=args.codex_bin,
             model=model,
             db_path=db_path,
-            source_name=args.source_name,
+            source_name=source_name,
             store_path=store_path,
             output_dir=output_dir,
             ground_truth=ground_truth,
+            questions=suite.questions,
             schema_path=schema_path,
             codex_timeout_seconds=args.codex_timeout,
         )
@@ -1497,14 +2872,17 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
     succeeded = benchmark_run_succeeded(results)
-    if succeeded and set(args.lanes) == set(VALID_LANES):
-        removed = cleanup_generated_benchmark_artifacts(output_dir, keep_latest=args.keep_latest_artifacts)
-        for path in removed:
-            print(f"removed old benchmark artifact: {path}", file=sys.stderr)
-    elif succeeded:
-        print("partial lane run succeeded; skipping artifact cleanup", file=sys.stderr)
-    else:
-        print("benchmark did not complete successfully; skipping artifact cleanup", file=sys.stderr)
+    removed = cleanup_generated_benchmark_artifacts(
+        output_dir,
+        keep_latest=args.keep_latest_artifacts,
+        keep_latest_partial=args.keep_latest_partial_artifacts,
+    )
+    for path in removed:
+        print(f"removed old benchmark artifact: {path}", file=sys.stderr)
+    if not succeeded:
+        print("benchmark did not complete successfully; generated artifacts were still bounded", file=sys.stderr)
+    elif set(args.lanes) != set(VALID_LANES):
+        print("partial lane run succeeded; generated artifacts were still bounded", file=sys.stderr)
     print(f"report: {output_dir / 'report.md'}")
     return 0
 

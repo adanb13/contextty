@@ -27,24 +27,12 @@ def make_node_id(kind: str, *parts: str) -> str:
     return f"{kind}:{digest}:{label or kind}"
 
 
-DOMAIN_COLUMN_EXACT_NAMES = {
-    "employment_status",
-    "request_type",
-    "review_period",
-    "signup_state",
-}
-DOMAIN_COLUMN_TOKENS = {"currency", "level", "reason", "role", "state", "status", "type"}
+DOMAIN_COLUMN_TOKENS = {"currency", "level", "period", "reason", "role", "state", "status", "type"}
 COLUMN_GROUP_TOKENS = {
     "date",
-    "department",
-    "employee",
     "id",
     "level",
-    "manager",
-    "project",
-    "review",
     "role",
-    "salary",
     "state",
     "status",
     "type",
@@ -730,9 +718,8 @@ def is_value_domain_column(column: ColumnInfo, profile: ColumnProfile) -> bool:
         return False
     if not profile.top_values:
         return False
-    name = column.name.lower()
-    tokens = column_tokens(name)
-    return name in DOMAIN_COLUMN_EXACT_NAMES or bool(tokens.intersection(DOMAIN_COLUMN_TOKENS))
+    tokens = column_tokens(column.name.lower())
+    return bool(tokens.intersection(DOMAIN_COLUMN_TOKENS))
 
 
 def domain_top_values(profile: ColumnProfile, limit: int = 12) -> list[dict[str, Any]]:
@@ -755,8 +742,6 @@ def value_domain_data(column: ColumnInfo, profile: ColumnProfile) -> dict[str, A
 
 def column_group_name(column: ColumnInfo) -> str | None:
     tokens = column_tokens(column.name)
-    if "salary" in tokens or column.name.startswith("salary_"):
-        return "salary"
     if "status" in tokens or "state" in tokens:
         return "status"
     if "date" in tokens or column.name.endswith("_on") or column.name.endswith("_at"):

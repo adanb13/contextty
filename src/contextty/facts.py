@@ -71,7 +71,8 @@ DOMAIN_TOKENS = {
     "type",
 }
 COMPACT_TEXT_ATTRIBUTE_TOKENS = {"center", "code", "country", "currency", "level", "number", "reason", "role", "state", "status", "type"}
-DATE_TOKENS = {"date", "time", "created", "completed", "effective", "ended", "hire", "opened", "started", "submitted"}
+COMPACT_IDENTIFIER_TOKENS = {"code", "identifier", "number", "ref", "reference"}
+DATE_TOKENS = {"date", "time", "created", "completed", "effective", "ended", "opened", "started", "submitted"}
 ID_TOKENS = {"id", "key"}
 STOP_WORDS = {
     "a",
@@ -104,9 +105,13 @@ def tokenize(text: str) -> list[str]:
     for token in re.findall(r"[A-Za-z0-9_]+", text.lower()):
         if len(token) > 1 and token not in STOP_WORDS:
             tokens.append(token)
+            if token.endswith("s") and len(token) > 3:
+                tokens.append(token[:-1])
         for part in token.split("_"):
             if len(part) > 1 and part not in STOP_WORDS:
                 tokens.append(part)
+                if part.endswith("s") and len(part) > 3:
+                    tokens.append(part[:-1])
     return tokens
 
 
@@ -280,6 +285,7 @@ class RowFactContext:
             self.foreign_keys_by_table[(fk.schema, fk.table)].append(fk)
         self.row_lookup: dict[tuple[str, str], dict[tuple[Any, ...], dict[str, Any]]] = {}
         self.row_lookup_by_column: dict[tuple[str, str, str], dict[Any, dict[str, Any]]] = {}
+        self.dynamic_label_columns_by_table: dict[tuple[str, str], list[str]] = {}
         for key, rows in self.rows_by_table.items():
             for column in self.columns_by_table.get(key, []):
                 by_column: dict[Any, dict[str, Any]] = {}
@@ -296,6 +302,7 @@ class RowFactContext:
                 if all(value is not None for value in row_key):
                     lookup[row_key] = row
             self.row_lookup[key] = lookup
+            self.dynamic_label_columns_by_table[key] = self._detect_dynamic_label_columns(key)
 
     def pk_columns(self, table_key: tuple[str, str]) -> list[str]:
         pks = sorted(self.primary_keys_by_table.get(table_key, []), key=lambda pk: pk.ordinal)
@@ -315,10 +322,38 @@ class RowFactContext:
         for column_set in LABEL_COLUMN_SETS:
             if all(column in names and row.get(column) not in (None, "") for column in column_set):
                 return truncate_value(" ".join(str(row[column]) for column in column_set))
+        for column in self.dynamic_label_columns_by_table.get(table_key, []):
+            value = row.get(column)
+            if value not in (None, ""):
+                return truncate_value(str(value))
         pk_cols = self.pk_columns(table_key)
         if pk_cols and all(row.get(column) is not None for column in pk_cols):
             return ",".join(str(row[column]) for column in pk_cols)
         return None
+
+    def _detect_dynamic_label_columns(self, table_key: tuple[str, str]) -> list[str]:
+        rows = self.rows_by_table.get(table_key, [])
+        if not rows:
+            return []
+        pk_columns = set(self.pk_columns(table_key))
+        fk_columns = {fk.column for fk in self.foreign_keys_by_table.get(table_key, [])}
+        candidates: list[tuple[int, str]] = []
+        for column in self.columns_by_table.get(table_key, []):
+            if column.name in pk_columns or column.name in fk_columns:
+                continue
+            if not is_dynamic_label_column(column):
+                continue
+            values = [str(row[column.name]).strip() for row in rows if row.get(column.name) not in (None, "")]
+            if not values:
+                continue
+            unique_values = set(values)
+            uniqueness = len(unique_values) / len(values)
+            if uniqueness < 0.9:
+                continue
+            if max(len(value) for value in values) > MAX_TEXT_VALUE_LENGTH:
+                continue
+            candidates.append((dynamic_label_preference(column.name), column.name))
+        return [name for _score, name in sorted(candidates)[:3]]
 
     def target_row(self, fk: ForeignKeyInfo, row: dict[str, Any]) -> dict[str, Any] | None:
         value = row.get(fk.column)
@@ -350,7 +385,7 @@ def sample_columns_for_table(
 
     selected: list[str] = []
     for column in columns:
-        if column.name in pk_columns or column.name in fk_columns or column.name in label_columns:
+        if column.name in pk_columns or column.name in fk_columns or column.name in label_columns or is_dynamic_label_column(column):
             selected.append(column.name)
             continue
         if is_free_text_column(column) and column.name not in label_columns:
@@ -386,6 +421,7 @@ def add_entity_facts(context: RowFactContext, collector: FactCollector) -> None:
 
 def add_relationship_facts(context: RowFactContext, collector: FactCollector) -> None:
     grouped_self_fk: dict[tuple[str, str, str], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    grouped_fk: dict[tuple[str, str, str, str, str], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for table_key, fks in sorted(context.foreign_keys_by_table.items()):
         rows = context.rows_by_table.get(table_key, [])
         for fk in fks:
@@ -396,11 +432,16 @@ def add_relationship_facts(context: RowFactContext, collector: FactCollector) ->
                 target_label = context.label(target_key, target)
                 if not source_label or not target_label:
                     continue
+                source_attrs = selected_attributes(context, table_key, row, include_foreign_keys=False, limit=6)
+                grouped_fk[(fk.schema, fk.table, fk.column, fk.ref_schema, fk.ref_table)][target_label].append(
+                    f"{source_label} {render_attributes(source_attrs)}".strip()
+                )
                 target_attrs = selected_attributes(context, target_key, target or {}, include_foreign_keys=False, limit=4)
-                if fk.table == fk.ref_table and "manager" in fk.column.lower():
+                if fk.table == fk.ref_table:
                     text = (
-                        f"manager_relationship {context.table_label(table_key)}.{fk.column}: "
-                        f"{source_label} reports to {target_label}; manager={target_label}; direct_report={source_label}."
+                        f"self_reference {context.table_label(table_key)}.{fk.column}: "
+                        f"{source_label} references {target_label} in {context.table_label(target_key)}; "
+                        f"source={source_label}; target={target_label}."
                     )
                     grouped_self_fk[(fk.schema, fk.table, fk.column)][target_label].append(source_label)
                 else:
@@ -421,26 +462,54 @@ def add_relationship_facts(context: RowFactContext, collector: FactCollector) ->
                         "target_label": target_label,
                         "target_attributes": target_attrs,
                     },
-                    table_key,
-                )
+                table_key,
+            )
 
-    for (schema, table, column), reports_by_manager in grouped_self_fk.items():
+    for (schema, table, column, ref_schema, ref_table), rows_by_target in grouped_fk.items():
         table_key = (schema, table)
-        for manager, reports in sorted(reports_by_manager.items()):
-            reports = sorted(reports)
+        target_table = short_table_name(ref_schema, ref_table)
+        if schema == ref_schema and table == ref_table:
+            continue
+        for target_label, row_labels in sorted(rows_by_target.items()):
+            if not row_labels:
+                continue
             text = (
-                f"direct_reports {context.table_label(table_key)}.{column}: "
-                f"{manager} has direct_reports {', '.join(reports)}."
+                f"related_rows {short_table_name(schema, table)}.{column}: "
+                f"{target_label} has {short_table_name(schema, table)} rows "
+                + "; ".join(row_labels[:20])
+                + "."
             )
             collector.add(
                 "relationship",
-                f"{context.table_label(table_key)}.{column} direct reports {manager}",
+                f"{short_table_name(schema, table)}.{column} rows for {target_label}",
+                text,
+                {
+                    "table": short_table_name(schema, table),
+                    "column": column,
+                    "target_table": target_table,
+                    "target_label": target_label,
+                    "rows": row_labels[:20],
+                },
+                table_key,
+            )
+
+    for (schema, table, column), sources_by_target in grouped_self_fk.items():
+        table_key = (schema, table)
+        for target_label, source_labels in sorted(sources_by_target.items()):
+            source_labels = sorted(source_labels)
+            text = (
+                f"referenced_by {context.table_label(table_key)}.{column}: "
+                f"{target_label} is referenced by {', '.join(source_labels)}."
+            )
+            collector.add(
+                "relationship",
+                f"{context.table_label(table_key)}.{column} referenced by {target_label}",
                 text,
                 {
                     "table": context.table_label(table_key),
                     "column": column,
-                    "manager": manager,
-                    "direct_reports": reports,
+                    "target_label": target_label,
+                    "source_labels": source_labels,
                 },
                 table_key,
             )
@@ -662,6 +731,26 @@ def add_grouped_average_facts(context: RowFactContext, collector: FactCollector)
             for dimension_fk in dimensions:
                 dimension_key = (dimension_fk.ref_schema, dimension_fk.ref_table)
                 for measure in numeric_columns:
+                    averages = average_by_dimension(context, rows, fk, dimension_fk, measure)
+                    if averages:
+                        text = (
+                            f"average {context.table_label(table_key)}.{measure} by {context.table_label(dimension_key)} "
+                            f"via {context.table_label(entity_key)}.{dimension_fk.column}: "
+                            + render_mapping(averages)
+                            + "."
+                        )
+                        collector.add(
+                            "aggregate",
+                            f"average {context.table_label(table_key)}.{measure} by {context.table_label(dimension_key)}",
+                            text,
+                            {
+                                "table": context.table_label(table_key),
+                                "measure": measure,
+                                "group_table": context.table_label(dimension_key),
+                                "averages": averages,
+                            },
+                            table_key,
+                        )
                     if date_column:
                         latest_rows = latest_rows_by_key(rows, fk.column, date_column)
                         averages = average_by_dimension(context, latest_rows, fk, dimension_fk, measure)
@@ -817,12 +906,10 @@ def date_preference(column_name: str) -> tuple[int, str]:
         return (0, name)
     if "completed" in name:
         return (1, name)
-    if "hire" in name:
-        return (2, name)
     if "started" in name or name.startswith("start"):
+        return (2, name)
+    if "opened" in name or "created" in name:
         return (3, name)
-    if "assigned" in name:
-        return (4, name)
     return (5, name)
 
 
@@ -861,6 +948,24 @@ def is_compact_text_attribute_column(column: ColumnInfo) -> bool:
     if not any(token in data_type for token in ("char", "clob", "text", "uuid", "varchar")):
         return False
     return bool(name_tokens(column.name).intersection(COMPACT_TEXT_ATTRIBUTE_TOKENS))
+
+
+def is_dynamic_label_column(column: ColumnInfo) -> bool:
+    if is_free_text_column(column) or is_domain_column(column):
+        return False
+    data_type = column.data_type.lower()
+    if not any(token in data_type for token in ("char", "clob", "text", "uuid", "varchar")):
+        return False
+    tokens = name_tokens(column.name)
+    return bool(tokens.intersection(COMPACT_IDENTIFIER_TOKENS))
+
+
+def dynamic_label_preference(column_name: str) -> int:
+    tokens = name_tokens(column_name)
+    for index, token in enumerate(("number", "code", "identifier", "reference", "ref")):
+        if token in tokens:
+            return index
+    return 99
 
 
 def is_date_column(column: ColumnInfo) -> bool:

@@ -54,6 +54,7 @@ def test_query_context_and_find_path_use_local_graph(tmp_path) -> None:
     assert "signup_state" in result["context"]
     assert "value_domain public.users.signup_state" in result["context"]
     assert result["facts"]
+    assert result["routing_hints"]["likely_columns"][0]["qualified_name"].endswith("signup_state")
     assert any(node["kind"] == "table" and node["name"] == "users" for node in result["nodes"])
 
     nodes_by_name = {node["qualified_name"]: node["id"] for node in store.get_nodes(source.id)}

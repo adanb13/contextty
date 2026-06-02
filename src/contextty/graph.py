@@ -13,6 +13,70 @@ ROW_FACT_KINDS_FOR_PACK = ROW_FACT_KINDS
 SCHEMA_CONTEXT_WORD_CAP = 1200
 ANSWER_CONTEXT_WORD_CAP = 900
 MISS_CONTEXT_WORD_CAP = 160
+ROUTING_HINT_CONTEXT_WORD_CAP = 120
+STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "how",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "what",
+    "which",
+    "who",
+    "with",
+}
+SCHEMA_INTENT_TOKENS = {
+    "column",
+    "columns",
+    "composite",
+    "database",
+    "foreign",
+    "fk",
+    "index",
+    "indexes",
+    "key",
+    "keys",
+    "primary",
+    "profile",
+    "profiles",
+    "row",
+    "rows",
+    "schema",
+    "table",
+    "tables",
+    "value",
+    "values",
+}
+AGGREGATE_INTENT_TOKENS = {
+    "average",
+    "avg",
+    "count",
+    "counts",
+    "earliest",
+    "highest",
+    "latest",
+    "max",
+    "maximum",
+    "min",
+    "minimum",
+    "sum",
+    "total",
+    "totals",
+}
+RELATIONSHIP_INTENT_TOKENS = {"foreign", "fk", "join", "key", "link", "links", "reference", "references", "relationship"}
 ROW_LEVEL_FALLBACK_CONTEXT = (
     "NEEDS_DB_FALLBACK: no exact bounded snapshot fact matched this row or aggregate question. "
     "Use the involved tables and columns below if live read-only DB fallback is permitted."
@@ -22,11 +86,15 @@ ROW_LEVEL_FALLBACK_CONTEXT = (
 def tokenize(text: str) -> set[str]:
     tokens: set[str] = set()
     for token in re.findall(r"[A-Za-z0-9_]+", text.lower()):
-        if len(token) > 1:
+        if len(token) > 1 and token not in STOP_WORDS:
             tokens.add(token)
+            if token.endswith("s") and len(token) > 3:
+                tokens.add(token[:-1])
         for part in token.split("_"):
-            if len(part) > 1:
+            if len(part) > 1 and part not in STOP_WORDS:
                 tokens.add(part)
+                if part.endswith("s") and len(part) > 3:
+                    tokens.add(part[:-1])
     return tokens
 
 
@@ -37,6 +105,44 @@ def table_mentions_for(query: str) -> set[str]:
         if token.endswith("s"):
             mentions.add(token[:-1])
     return mentions
+
+
+def schema_similarity(query_tokens: set[str], text: str) -> tuple[float, list[str]]:
+    text_tokens = tokenize(text)
+    if not query_tokens or not text_tokens:
+        return 0.0, []
+    exact_matches = query_tokens.intersection(text_tokens)
+    fuzzy_matches: set[str] = set()
+    score = float(len(exact_matches) * 10)
+    candidate_tokens = [token for token in text_tokens if len(token) >= 3]
+    for query_token in query_tokens:
+        if query_token in exact_matches or len(query_token) < 3:
+            continue
+        best = max((ngram_similarity(query_token, token) for token in candidate_tokens), default=0.0)
+        if best >= 0.72:
+            fuzzy_matches.add(query_token)
+            score += best * 5.0
+    matched = sorted(exact_matches | fuzzy_matches)
+    return score, matched
+
+
+def ngram_similarity(left: str, right: str, size: int = 3) -> float:
+    if left == right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    left_grams = char_ngrams(left, size)
+    right_grams = char_ngrams(right, size)
+    if not left_grams or not right_grams:
+        return 0.0
+    return len(left_grams.intersection(right_grams)) / len(left_grams.union(right_grams))
+
+
+def char_ngrams(value: str, size: int) -> set[str]:
+    padded = f" {value.lower()} "
+    if len(padded) <= size:
+        return {padded}
+    return {padded[index : index + size] for index in range(len(padded) - size + 1)}
 
 
 class ContextGraph:
@@ -85,14 +191,15 @@ class ContextGraph:
     ) -> dict[str, Any]:
         query_mode = self._query_mode(query)
         answer_pack = self._is_answer_pack_query(query)
+        routing_hints = self._routing_hints(query)
         fact_budget = min(
             max(1, budget),
             12000 if answer_pack else (SCHEMA_CONTEXT_WORD_CAP if query_mode == "schema_profile" else ANSWER_CONTEXT_WORD_CAP),
         )
-        ranked_facts = self._rank_facts(query, query_mode)
+        ranked_facts = self._rank_facts(query, query_mode, routing_hints)
         rendered_facts, fact_context = self._render_facts(ranked_facts, fact_budget)
 
-        seeds = self._rank_nodes(query)[:5]
+        seeds = self._rank_nodes(query, routing_hints)[:5]
         seed_ids = [node["id"] for node, _score in seeds]
         if not seed_ids and self.nodes:
             seed_ids = list(self.nodes)[:1]
@@ -126,6 +233,9 @@ class ContextGraph:
         context_parts: list[str] = []
         if query_mode == "row_level" and not rendered_facts:
             context_parts.append(ROW_LEVEL_FALLBACK_CONTEXT)
+        routing_context = self._render_routing_context(routing_hints)
+        if routing_context and (not rendered_facts or not answer_pack):
+            context_parts.append(routing_context)
         if fact_context:
             context_parts.append(fact_context)
         if verbose_context:
@@ -138,7 +248,8 @@ class ContextGraph:
         return {
             "query": query,
             "answerability": answerability,
-            "answer_candidates": self._compact_answer_candidates(rendered_facts) if answer_pack else rendered_facts,
+            "routing_hints": routing_hints,
+            "answer_candidates": self._compact_answer_candidates(rendered_facts),
             "facts": [] if answer_pack else rendered_facts,
             "seeds": [] if answer_pack else [self._compact_node(node_id) for node_id in seed_ids if node_id in self.nodes],
             "nodes": selected_nodes,
@@ -226,16 +337,137 @@ class ContextGraph:
             for node_id, count in sorted(degree.items(), key=lambda item: (-item[1], self.nodes[item[0]]["qualified_name"]))
         ]
 
-    def _rank_nodes(self, query: str) -> list[tuple[dict[str, Any], float]]:
-        scored = [(node, self._node_score(query, node)) for node in self.nodes.values()]
+    def _routing_hints(self, query: str) -> dict[str, Any]:
+        query_tokens = tokenize(query)
+        column_names_by_table_id: dict[str, list[str]] = {}
+        for node in self.nodes.values():
+            if node.get("kind") == "column" and node.get("parent_id"):
+                column_names_by_table_id.setdefault(node["parent_id"], []).append(str(node.get("name") or ""))
+
+        likely_tables: list[dict[str, Any]] = []
+        likely_columns: list[dict[str, Any]] = []
+        matched_terms: set[str] = set()
+        for node in self.nodes.values():
+            kind = node.get("kind")
+            if kind not in {"table", "view", "column"}:
+                continue
+            fields = [node.get("name") or "", node.get("qualified_name") or "", node.get("summary") or ""]
+            if kind in {"table", "view"}:
+                fields.extend(column_names_by_table_id.get(node["id"], []))
+            score, terms = schema_similarity(query_tokens, " ".join(fields))
+            if score <= 0:
+                continue
+            matched_terms.update(terms)
+            if kind in {"table", "view"}:
+                likely_tables.append(
+                    {
+                        "node_id": node["id"],
+                        "name": node.get("name"),
+                        "qualified_name": node.get("qualified_name"),
+                        "kind": kind,
+                        "score": round(score, 3),
+                        "matched_terms": terms[:5],
+                    }
+                )
+            else:
+                properties = node.get("properties") or {}
+                likely_columns.append(
+                    {
+                        "node_id": node["id"],
+                        "name": node.get("name"),
+                        "qualified_name": node.get("qualified_name"),
+                        "table": properties.get("table"),
+                        "data_type": properties.get("data_type"),
+                        "score": round(score, 3),
+                        "matched_terms": terms[:5],
+                    }
+                )
+
+        likely_relationships: list[dict[str, Any]] = []
+        for edge in self.edges:
+            if edge.get("relation") != "foreign_key_to":
+                continue
+            from_node = self.nodes.get(edge["from_node_id"])
+            to_node = self.nodes.get(edge["to_node_id"])
+            if not from_node or not to_node:
+                continue
+            properties = edge.get("properties") or {}
+            fields = [
+                edge.get("relation") or "",
+                from_node.get("name") or "",
+                from_node.get("qualified_name") or "",
+                to_node.get("name") or "",
+                to_node.get("qualified_name") or "",
+                " ".join(str(value) for value in properties.values() if value is not None),
+            ]
+            score, terms = schema_similarity(query_tokens, " ".join(fields))
+            if query_tokens.intersection(RELATIONSHIP_INTENT_TOKENS):
+                score += 3.0
+            if score <= 0:
+                continue
+            matched_terms.update(terms)
+            likely_relationships.append(
+                {
+                    "from": from_node.get("qualified_name"),
+                    "to": to_node.get("qualified_name"),
+                    "relation": edge.get("relation"),
+                    "score": round(score, 3),
+                    "matched_terms": terms[:5],
+                }
+            )
+
+        likely_tables.sort(key=lambda item: (-item["score"], str(item["qualified_name"])))
+        likely_columns.sort(key=lambda item: (-item["score"], str(item["qualified_name"])))
+        likely_relationships.sort(key=lambda item: (-item["score"], str(item["from"]), str(item["to"])))
+        return {
+            "matched_terms": sorted(matched_terms)[:12],
+            "likely_tables": likely_tables[:4],
+            "likely_columns": likely_columns[:6],
+            "likely_relationships": likely_relationships[:4],
+        }
+
+    def _routing_fact_boost(self, fact: dict[str, Any], query_tokens: set[str], routing_hints: dict[str, Any]) -> float:
+        fact_text = " ".join([str(fact.get("subject") or ""), str(fact.get("text") or ""), str(fact.get("search_text") or "")]).lower()
+        boost = 0.0
+        for table in routing_hints.get("likely_tables", []):
+            if not isinstance(table, dict):
+                continue
+            for value in (table.get("name"), table.get("qualified_name")):
+                if value and str(value).lower() in fact_text:
+                    boost += min(18.0, float(table.get("score") or 0.0) * 0.8)
+                    break
+        for column in routing_hints.get("likely_columns", []):
+            if not isinstance(column, dict):
+                continue
+            for value in (column.get("name"), column.get("qualified_name")):
+                if value and str(value).lower() in fact_text:
+                    boost += min(12.0, float(column.get("score") or 0.0) * 0.6)
+                    break
+        kind = fact.get("kind")
+        if kind in {"aggregate", "latest_metric"} and query_tokens.intersection(AGGREGATE_INTENT_TOKENS):
+            boost += 6.0
+        if kind in {"relationship", "relationship_card", "bridge"} and query_tokens.intersection(RELATIONSHIP_INTENT_TOKENS):
+            boost += 6.0
+        return boost
+
+    def _rank_nodes(self, query: str, routing_hints: dict[str, Any] | None = None) -> list[tuple[dict[str, Any], float]]:
+        hint_groups = (
+            (routing_hints or {}).get("likely_tables", []),
+            (routing_hints or {}).get("likely_columns", []),
+        )
+        hint_node_ids = {item.get("node_id") for group in hint_groups for item in group if isinstance(item, dict)}
+        scored = [
+            (node, self._node_score(query, node) + (6.0 if node["id"] in hint_node_ids else 0.0))
+            for node in self.nodes.values()
+        ]
         scored = [(node, score) for node, score in scored if score > 0]
         return sorted(scored, key=lambda item: (-item[1], item[0]["kind"], item[0]["qualified_name"]))
 
-    def _rank_facts(self, query: str, query_mode: str) -> list[dict[str, Any]]:
+    def _rank_facts(self, query: str, query_mode: str, routing_hints: dict[str, Any]) -> list[dict[str, Any]]:
         if self.snapshot_run_id is None:
             return []
         if self._is_answer_pack_query(query):
-            return self._rank_answer_pack_facts(query)
+            return self._rank_answer_pack_facts(query, routing_hints)
         facts = self.store.search_facts(query, snapshot_run_id=self.snapshot_run_id, limit=32)
         facts = [fact for fact in facts if fact.get("kind") in ANSWER_FACT_KINDS]
         if not facts:
@@ -244,25 +476,18 @@ class ContextGraph:
         query_tokens = tokenize(query)
         required_phrases = self._query_phrases(query) if query_mode == "row_level" else []
         inventory = [fact for fact in facts if fact.get("kind") == "table_inventory"]
-        lowered_query = query.lower()
-        if query_mode == "schema_profile" and inventory and (
-            "how many user tables" in lowered_query
-            or "how many rows" in lowered_query
-            or "rows are in each" in lowered_query
-            or "row counts" in lowered_query
-        ):
-            return inventory[:1]
         scored: list[tuple[dict[str, Any], float]] = []
         for fact in facts:
             fact_text = " ".join([str(fact.get("subject") or ""), str(fact.get("text") or ""), str(fact.get("search_text") or "")]).lower()
             if required_phrases and not any(phrase.lower() in fact_text for phrase in required_phrases):
                 continue
             score = float(fact.get("score") or 0.0)
+            score += self._routing_fact_boost(fact, query_tokens, routing_hints)
             if fact.get("kind") == "table_inventory" and query_mode == "schema_profile":
                 score += 2.0
-            if fact.get("kind") in {"relationship", "relationship_card"} and any(token in query_tokens for token in {"fk", "foreign", "key", "manager", "report", "reports", "reference", "references"}):
+            if fact.get("kind") in {"relationship", "relationship_card"} and query_tokens.intersection(RELATIONSHIP_INTENT_TOKENS):
                 score += 2.0
-            if fact.get("kind") in {"aggregate", "value_domain"} and any(token in query_tokens for token in {"average", "count", "counts", "highest", "latest", "profile", "profiles", "total", "value", "values", "domain"}):
+            if fact.get("kind") in {"aggregate", "value_domain"} and query_tokens.intersection(AGGREGATE_INTENT_TOKENS | SCHEMA_INTENT_TOKENS):
                 score += 2.0
             if score > 0:
                 scored.append((fact, score))
@@ -293,7 +518,7 @@ class ContextGraph:
             or len(tokenize(query)) >= 45
         )
 
-    def _rank_answer_pack_facts(self, query: str) -> list[dict[str, Any]]:
+    def _rank_answer_pack_facts(self, query: str, routing_hints: dict[str, Any]) -> list[dict[str, Any]]:
         query_tokens = tokenize(query)
         query_token_set = set(query_tokens)
         phrases = self._query_phrases(query)
@@ -312,11 +537,9 @@ class ContextGraph:
             if fact.get("kind") == "table_inventory":
                 add(fact, 1000.0)
 
-        table_mentions = table_mentions_for(query)
-        lowered_query = query.lower()
         scored_schema: list[tuple[dict[str, Any], float]] = []
         scored_values: list[tuple[dict[str, Any], float]] = []
-        priority_rows: list[tuple[dict[str, Any], float]] = []
+        scored_aggregates: list[tuple[dict[str, Any], float]] = []
         scored_rows: list[tuple[dict[str, Any], float]] = []
         for fact in self.facts:
             kind = fact.get("kind")
@@ -327,53 +550,29 @@ class ContextGraph:
             fact_tokens = set(tokenize(text))
             overlap = len(query_token_set.intersection(fact_tokens))
             phrase_hits = sum(1 for phrase in phrases if phrase.lower() in text_lower)
-            score = overlap * 4.0 + phrase_hits * 30.0
+            score = overlap * 4.0 + phrase_hits * 30.0 + self._routing_fact_boost(fact, query_tokens, routing_hints)
             if kind == "table_schema":
-                subject_table = str(fact.get("subject") or "").split(".")[-1].lower()
-                if subject_table in table_mentions:
-                    score += 60.0
-                if score >= 24.0:
+                if score >= 12.0:
                     scored_schema.append((fact, score))
             elif kind == "value_domain":
                 if score >= 12.0:
                     scored_values.append((fact, score + 20.0))
+            elif kind in {"aggregate", "latest_metric"}:
+                if phrase_hits or score >= 12.0:
+                    scored_aggregates.append((fact, score + 8.0))
             elif kind in ROW_FACT_KINDS_FOR_PACK:
-                priority = self._answer_pack_row_priority(lowered_query, text_lower)
-                if priority:
-                    priority_rows.append((fact, score + priority))
-                elif phrase_hits or score >= 24.0:
+                if phrase_hits or score >= 16.0:
                     scored_rows.append((fact, score))
 
         for fact, score in sorted(scored_schema, key=lambda item: (-item[1], item[0]["subject"]))[:14]:
             add(fact, score)
         for fact, score in sorted(scored_values, key=lambda item: (-item[1], item[0]["subject"]))[:10]:
             add(fact, score)
-        for fact, score in sorted(priority_rows, key=lambda item: (-item[1], item[0]["kind"], item[0]["subject"]))[:60]:
+        for fact, score in sorted(scored_aggregates, key=lambda item: (-item[1], item[0]["kind"], item[0]["subject"]))[:40]:
             add(fact, score)
-        for fact, score in sorted(scored_rows, key=lambda item: (-item[1], item[0]["kind"], item[0]["subject"]))[:20]:
+        for fact, score in sorted(scored_rows, key=lambda item: (-item[1], item[0]["kind"], item[0]["subject"]))[:80]:
             add(fact, score)
         return selected[:100]
-
-    @staticmethod
-    def _answer_pack_row_priority(query_lower: str, fact_lower: str) -> float:
-        score = 0.0
-        if "earliest" in query_lower and "hire_date" in query_lower and "earliest" in fact_lower and "hire_date" in fact_lower:
-            score += 140.0
-        if "latest salary" in query_lower and "salary_history" in fact_lower and "latest" in fact_lower:
-            score += 140.0
-        if "highest total" in query_lower and "allocation_percent" in query_lower and "top summed" in fact_lower and "allocation_percent" in fact_lower:
-            score += 140.0
-        if "average latest salary" in query_lower and "average latest" in fact_lower and "salary_history.salary" in fact_lower:
-            score += 150.0
-        if "performance review rating" in query_lower and "average" in fact_lower and "performance_reviews.rating" in fact_lower:
-            score += 150.0
-        if "department owning" in query_lower and "payroll modernization" in fact_lower and "cost_center" in fact_lower:
-            score += 150.0
-        if "assigned to manager insights dashboard" in query_lower and "manager insights dashboard" in fact_lower:
-            score += 130.0
-        if "direct reports" in query_lower and "direct_reports" in fact_lower:
-            score += 130.0
-        return score
 
     def _pill_score(self, query: str, pill: dict[str, Any]) -> float:
         query_tokens = tokenize(query)
@@ -419,27 +618,14 @@ class ContextGraph:
 
     def _query_mode(self, query: str) -> str:
         lowered = query.lower()
-        row_markers = {
-            "assigned to",
-            "average latest salary",
-            "direct reports",
-            "earliest hire_date",
-            "highest total",
-            "latest salary",
-            "owns",
-            "performance review rating",
-            "report directly",
-            "who is",
-        }
-        if any(marker in lowered for marker in row_markers):
-            return "row_level"
+        query_tokens = tokenize(query)
         if re.search(r"['\"][^'\"]+['\"]", query):
             return "row_level"
         if re.search(r"\b[A-Z][a-z]+ [A-Z][a-z]+(?:'s)?\b", query):
             return "row_level"
         if lowered.startswith("who "):
             return "row_level"
-        if "which employees" in lowered or "which active employee" in lowered:
+        if query_tokens.intersection(AGGREGATE_INTENT_TOKENS) and not query_tokens.intersection({"value", "values", "profile", "profiles"}):
             return "row_level"
         return "schema_profile"
 
@@ -543,6 +729,36 @@ class ContextGraph:
             if include_pills:
                 selected_pills.extend(self._compact_pill(pill) for pill in pills[:5])
         return selected_nodes, selected_pills, "\n\n".join(lines)
+
+    @staticmethod
+    def _render_routing_context(routing_hints: dict[str, Any]) -> str:
+        lines: list[str] = []
+        tables = [
+            str(item.get("qualified_name") or item.get("name"))
+            for item in routing_hints.get("likely_tables", [])[:4]
+            if isinstance(item, dict) and (item.get("qualified_name") or item.get("name"))
+        ]
+        columns = [
+            str(item.get("qualified_name") or item.get("name"))
+            for item in routing_hints.get("likely_columns", [])[:6]
+            if isinstance(item, dict) and (item.get("qualified_name") or item.get("name"))
+        ]
+        relationships = [
+            f"{item.get('from')} -> {item.get('to')}"
+            for item in routing_hints.get("likely_relationships", [])[:4]
+            if isinstance(item, dict) and item.get("from") and item.get("to")
+        ]
+        if tables:
+            lines.append("routing likely_tables: " + ", ".join(tables))
+        if columns:
+            lines.append("routing likely_columns: " + ", ".join(columns))
+        if relationships:
+            lines.append("routing likely_relationships: " + "; ".join(relationships))
+        text = "\n".join(lines)
+        words = text.split()
+        if len(words) > ROUTING_HINT_CONTEXT_WORD_CAP:
+            return " ".join(words[:ROUTING_HINT_CONTEXT_WORD_CAP])
+        return text
 
     def _render_facts(self, facts: list[dict[str, Any]], budget: int) -> tuple[list[dict[str, Any]], str]:
         rendered: list[dict[str, Any]] = []

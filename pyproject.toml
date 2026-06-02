@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "contextty"
 version = "0.0.2"
-description = "Local database context for AI agents: read-only snapshots, relationship graphs, and bounded profiling through CLI, API, and MCP."
+description = "Database-agnostic context for AI agents: read-only snapshots, relationship graphs, and bounded profiling through CLI, API, and MCP."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Contextty Contributors" }]
-keywords = ["ai", "agents", "mcp", "database", "schema", "metadata", "postgresql", "sqlite", "graph"]
+keywords = ["ai", "agents", "mcp", "database", "schema", "metadata", "sql", "relational", "graph"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",

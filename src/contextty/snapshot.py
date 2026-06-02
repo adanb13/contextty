@@ -11,6 +11,7 @@ from .models import (
     ForeignKeyInfo,
     IndexInfo,
     InspectionResult,
+    PrimaryKeyInfo,
     SnapshotRun,
     Source,
     TableInfo,
@@ -24,6 +25,30 @@ def make_node_id(kind: str, *parts: str) -> str:
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
     label = re.sub(r"[^A-Za-z0-9_.-]+", "_", ".".join(parts)).strip("._")[:80]
     return f"{kind}:{digest}:{label or kind}"
+
+
+DOMAIN_COLUMN_EXACT_NAMES = {
+    "employment_status",
+    "request_type",
+    "review_period",
+    "signup_state",
+}
+DOMAIN_COLUMN_TOKENS = {"currency", "level", "reason", "role", "state", "status", "type"}
+COLUMN_GROUP_TOKENS = {
+    "date",
+    "department",
+    "employee",
+    "id",
+    "level",
+    "manager",
+    "project",
+    "review",
+    "role",
+    "salary",
+    "state",
+    "status",
+    "type",
+}
 
 
 class ArtifactBuilder:
@@ -42,6 +67,7 @@ class ArtifactBuilder:
         self.edges: list[dict[str, Any]] = []
         self.pills: list[dict[str, Any]] = []
         self._node_ids: set[str] = set()
+        self._db_id: str | None = None
         self._schema_ids: dict[str, str] = {}
         self._table_ids: dict[tuple[str, str], str] = {}
         self._column_ids: dict[tuple[str, str, str], str] = {}
@@ -49,6 +75,7 @@ class ArtifactBuilder:
     def build(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         source_id = make_node_id("source", self.source.name)
         db_id = make_node_id("database", self.source.name, self.inspection.database)
+        self._db_id = db_id
         source_properties = {"connector_type": self.source.connector_type}
         if self.source.connector_type == "postgres":
             source_properties["dsn_env"] = self.source.dsn_env
@@ -79,6 +106,7 @@ class ArtifactBuilder:
             self._add_foreign_key(foreign_key)
 
         self._add_context_pills()
+        self._add_compact_facts()
         return self.nodes, self.edges, self.pills
 
     def _ensure_schema(self, db_id: str, schema: str) -> str:
@@ -209,6 +237,190 @@ class ArtifactBuilder:
                     "patterns": profile.patterns,
                 }
                 self._add_pill(column_id, "text_patterns", f"Text patterns {column.schema}.{column.table}.{column.name}", pattern_data, render_pattern_pill(pattern_data))
+
+    def _add_compact_facts(self) -> None:
+        self._add_table_inventory_fact()
+        self._add_table_schema_facts()
+        self._add_value_domain_facts()
+        self._add_column_group_facts()
+        self._add_relationship_cards()
+
+    def _add_table_inventory_fact(self) -> None:
+        if self._db_id is None:
+            return
+        tables = [table for table in self.inspection.tables if table.kind == "table"]
+        data = {
+            "database": self.inspection.database,
+            "connector_type": self.source.connector_type,
+            "user_table_count": len(tables),
+            "tables": [
+                {
+                    "table": short_table_name(table.schema, table.name),
+                    "row_count": table_row_count(table, self.profiles.get((table.schema, table.name))),
+                    "row_count_is_capped": table_row_count_is_capped(self.profiles.get((table.schema, table.name))),
+                }
+                for table in sorted(tables, key=lambda item: (item.schema, item.name))
+            ],
+            "views": [
+                short_table_name(table.schema, table.name)
+                for table in sorted(self.inspection.tables, key=lambda item: (item.schema, item.name))
+                if table.kind in {"view", "materialized_view"}
+            ],
+        }
+        self._add_pill(
+            self._db_id,
+            "table_inventory",
+            f"Table inventory {self.inspection.database}",
+            data,
+            render_table_inventory_fact(data),
+        )
+
+    def _add_table_schema_facts(self) -> None:
+        columns_by_table: dict[tuple[str, str], list[ColumnInfo]] = {}
+        for column in self.inspection.columns:
+            columns_by_table.setdefault((column.schema, column.table), []).append(column)
+
+        for table in sorted(self.inspection.tables, key=lambda item: (item.schema, item.name)):
+            if table.kind != "table":
+                continue
+            table_id = self._table_ids.get((table.schema, table.name))
+            if not table_id:
+                continue
+            profile = self.profiles.get((table.schema, table.name))
+            pks = sorted(self._pks_for(table), key=lambda pk: pk.ordinal)
+            fks = sorted(self._fks_for(table), key=lambda fk: (fk.column, fk.ref_table, fk.ref_column))
+            indexes = sorted(self._indexes_for(table), key=lambda index: index.name)
+            data = {
+                "table": short_table_name(table.schema, table.name),
+                "qualified_table": table.qualified_name,
+                "row_count": table_row_count(table, profile),
+                "row_count_is_capped": table_row_count_is_capped(profile),
+                "columns": [
+                    {
+                        "name": column.name,
+                        "type": column.data_type,
+                        "nullable": column.nullable,
+                        "primary_key": any(pk.column == column.name for pk in pks),
+                        "foreign_key": fk_reference_for(column.name, fks),
+                    }
+                    for column in sorted(columns_by_table.get((table.schema, table.name), []), key=lambda item: item.ordinal)
+                ],
+                "primary_key": [pk.column for pk in pks],
+                "foreign_keys": [
+                    {
+                        "column": fk.column,
+                        "references": short_column_name(fk.ref_schema, fk.ref_table, fk.ref_column),
+                        "constraint": fk.constraint_name,
+                    }
+                    for fk in fks
+                ],
+                "indexes": [
+                    {
+                        "name": index.name,
+                        "columns": index.columns,
+                        "unique": index.unique,
+                        "primary": index.primary,
+                    }
+                    for index in indexes
+                ],
+            }
+            self._add_pill(
+                table_id,
+                "table_schema",
+                f"Table schema {table.schema}.{table.name}",
+                data,
+                render_table_schema_fact(data),
+            )
+
+    def _add_value_domain_facts(self) -> None:
+        for column in sorted(self.inspection.columns, key=lambda item: (item.schema, item.table, item.ordinal)):
+            profile = self.profiles.get((column.schema, column.table), TableProfile()).columns.get(column.name)
+            if not profile or not is_value_domain_column(column, profile):
+                continue
+            column_id = self._column_ids.get((column.schema, column.table, column.name))
+            if not column_id:
+                continue
+            data = value_domain_data(column, profile)
+            self._add_pill(
+                column_id,
+                "value_domain",
+                f"Value domain {column.schema}.{column.table}.{column.name}",
+                data,
+                render_value_domain_fact(data),
+            )
+
+    def _add_column_group_facts(self) -> None:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for column in sorted(self.inspection.columns, key=lambda item: (item.schema, item.table, item.ordinal)):
+            group = column_group_name(column)
+            if group is None:
+                continue
+            profile = self.profiles.get((column.schema, column.table), TableProfile()).columns.get(column.name)
+            grouped.setdefault(group, []).append(
+                {
+                    "column": short_column_name(column.schema, column.table, column.name),
+                    "type": column.data_type,
+                    "nullable": column.nullable,
+                    "role": column_role(column, self._is_pk(column), self._fk_for(column)),
+                    "distinct": profile.distinct_count if profile else None,
+                    "null_rate": round(profile.null_rate, 3) if profile and profile.null_rate is not None else None,
+                    "top_values": domain_top_values(profile) if profile and is_value_domain_column(column, profile) else [],
+                }
+            )
+
+        for group, columns in sorted(grouped.items()):
+            if len(columns) < 2:
+                continue
+            data = {"group": group, "columns": columns[:30], "column_count": len(columns)}
+            node_id = self._db_id or next(iter(self._table_ids.values()), None)
+            if not node_id:
+                continue
+            self._add_pill(
+                node_id,
+                "column_group",
+                f"Column group {group}",
+                data,
+                render_column_group_fact(data),
+            )
+
+    def _add_relationship_cards(self) -> None:
+        fks_by_table: dict[tuple[str, str], list[ForeignKeyInfo]] = {}
+        for fk in self.inspection.foreign_keys:
+            fks_by_table.setdefault((fk.schema, fk.table), []).append(fk)
+
+        for (schema, table), fks in sorted(fks_by_table.items()):
+            table_id = self._table_ids.get((schema, table))
+            if not table_id:
+                continue
+            data = {
+                "table": short_table_name(schema, table),
+                "foreign_keys": [
+                    {
+                        "column": fk.column,
+                        "references": short_column_name(fk.ref_schema, fk.ref_table, fk.ref_column),
+                        "constraint": fk.constraint_name,
+                    }
+                    for fk in sorted(fks, key=lambda item: (item.column, item.ref_table, item.ref_column))
+                ],
+            }
+            self._add_pill(
+                table_id,
+                "relationship_card",
+                f"Relationships {schema}.{table}",
+                data,
+                render_relationship_card(data),
+            )
+
+        communities = relationship_communities(self.inspection.tables, self.inspection.foreign_keys)
+        if communities and self._db_id is not None:
+            data = {"communities": communities}
+            self._add_pill(
+                self._db_id,
+                "relationship_card",
+                f"Relationship communities {self.inspection.database}",
+                data,
+                render_relationship_communities_card(data),
+            )
 
     def _add_pill(self, node_id: str, kind: str, title: str, data: dict[str, Any], rendered_text: str) -> None:
         pill_id = make_node_id("pill", self.source.name, str(self.run.id), kind, title)
@@ -463,3 +675,222 @@ def render_time_window_pill(data: dict[str, Any]) -> str:
     last = windows[-1]["window_start"]
     total = sum(int(item["count"]) for item in windows)
     return f"{data['table']} has {total} sampled rows across {len(windows)} time windows from {first} to {last}."
+
+
+def short_table_name(schema: str, table: str) -> str:
+    return f"{schema}.{table}" if schema else table
+
+
+def short_column_name(schema: str, table: str, column: str) -> str:
+    return f"{short_table_name(schema, table)}.{column}"
+
+
+def table_row_count(table: TableInfo, profile: TableProfile | None) -> int | None:
+    if profile and profile.row_count is not None:
+        return profile.row_count
+    return table.row_estimate
+
+
+def table_row_count_is_capped(profile: TableProfile | None) -> bool:
+    return bool(profile and profile.row_count_is_capped)
+
+
+def fk_reference_for(column_name: str, fks: list[ForeignKeyInfo]) -> str | None:
+    for fk in fks:
+        if fk.column == column_name:
+            return short_column_name(fk.ref_schema, fk.ref_table, fk.ref_column)
+    return None
+
+
+def column_role(column: ColumnInfo, is_pk: bool, fk: ForeignKeyInfo | None) -> str:
+    roles = []
+    if is_pk:
+        roles.append("pk")
+    if fk:
+        roles.append("fk")
+    if not roles and column.name.endswith("_id"):
+        roles.append("id")
+    return "+".join(roles) if roles else "attribute"
+
+
+def column_tokens(name: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9]+", name.lower()):
+        if len(token) > 1:
+            tokens.add(token)
+    for part in name.lower().split("_"):
+        if len(part) > 1:
+            tokens.add(part)
+    return tokens
+
+
+def is_value_domain_column(column: ColumnInfo, profile: ColumnProfile) -> bool:
+    distinct_count = profile.distinct_count
+    if distinct_count is None or distinct_count > 20:
+        return False
+    if not profile.top_values:
+        return False
+    name = column.name.lower()
+    tokens = column_tokens(name)
+    return name in DOMAIN_COLUMN_EXACT_NAMES or bool(tokens.intersection(DOMAIN_COLUMN_TOKENS))
+
+
+def domain_top_values(profile: ColumnProfile, limit: int = 12) -> list[dict[str, Any]]:
+    values = []
+    for item in profile.top_values[:limit]:
+        values.append({"value": item.get("value"), "count": item.get("count")})
+    return values
+
+
+def value_domain_data(column: ColumnInfo, profile: ColumnProfile) -> dict[str, Any]:
+    return {
+        "column": short_column_name(column.schema, column.table, column.name),
+        "type": column.data_type,
+        "distinct": profile.distinct_count,
+        "null_count": profile.null_count,
+        "null_rate": round(profile.null_rate, 3) if profile.null_rate is not None else None,
+        "values": domain_top_values(profile),
+    }
+
+
+def column_group_name(column: ColumnInfo) -> str | None:
+    tokens = column_tokens(column.name)
+    if "salary" in tokens or column.name.startswith("salary_"):
+        return "salary"
+    if "status" in tokens or "state" in tokens:
+        return "status"
+    if "date" in tokens or column.name.endswith("_on") or column.name.endswith("_at"):
+        return "date_time"
+    for token in sorted(COLUMN_GROUP_TOKENS):
+        if token in tokens:
+            return token
+    if column.name == "id" or column.name.endswith("_id"):
+        return "id"
+    return None
+
+
+def relationship_communities(tables: list[TableInfo], foreign_keys: list[ForeignKeyInfo]) -> list[dict[str, Any]]:
+    table_names = {
+        (table.schema, table.name): short_table_name(table.schema, table.name)
+        for table in tables
+        if table.kind == "table"
+    }
+    neighbors: dict[tuple[str, str], set[tuple[str, str]]] = {key: set() for key in table_names}
+    for fk in foreign_keys:
+        source = (fk.schema, fk.table)
+        target = (fk.ref_schema, fk.ref_table)
+        if source not in neighbors or target not in neighbors:
+            continue
+        neighbors[source].add(target)
+        neighbors[target].add(source)
+
+    communities: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for table_key in sorted(neighbors):
+        if table_key in seen:
+            continue
+        stack = [table_key]
+        seen.add(table_key)
+        members: list[tuple[str, str]] = []
+        while stack:
+            current = stack.pop()
+            members.append(current)
+            for neighbor in neighbors[current]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        if len(members) > 1:
+            communities.append(
+                {
+                    "tables": [table_names[key] for key in sorted(members)],
+                    "table_count": len(members),
+                }
+            )
+    return communities
+
+
+def render_table_inventory_fact(data: dict[str, Any]) -> str:
+    rows = ", ".join(
+        f"{item['table']}={item['row_count']}{' capped' if item.get('row_count_is_capped') else ''}"
+        for item in data.get("tables", [])
+    )
+    views = ", ".join(data.get("views") or []) or "none"
+    return (
+        f"snapshot_inventory database={data['database']} connector={data['connector_type']} "
+        f"user_tables={data['user_table_count']}; row_counts: {rows}; views: {views}."
+    )
+
+
+def render_table_schema_fact(data: dict[str, Any]) -> str:
+    column_bits: list[str] = []
+    for column in data.get("columns", []):
+        flags = []
+        if column.get("primary_key"):
+            flags.append("pk")
+        if column.get("foreign_key"):
+            flags.append(f"fk->{column['foreign_key']}")
+        flags.append("nullable" if column.get("nullable") else "not_null")
+        suffix = f" [{' '.join(flags)}]" if flags else ""
+        column_bits.append(f"{column['name']} {column['type']}{suffix}")
+
+    parts = [
+        f"table_schema {data['table']} rows={data.get('row_count')}",
+        "columns: " + ", ".join(column_bits),
+    ]
+    if data.get("primary_key"):
+        parts.append("primary_key=(" + ", ".join(data["primary_key"]) + ")")
+    if data.get("foreign_keys"):
+        refs = ", ".join(f"{fk['column']}->{fk['references']}" for fk in data["foreign_keys"])
+        parts.append("foreign_keys: " + refs)
+    if data.get("indexes"):
+        indexes = ", ".join(
+            f"{index['name']}({', '.join(index['columns'])})"
+            + (" unique" if index.get("unique") else "")
+            + (" primary" if index.get("primary") else "")
+            for index in data["indexes"]
+        )
+        parts.append("indexes: " + indexes)
+    return "; ".join(parts) + "."
+
+
+def render_value_domain_fact(data: dict[str, Any]) -> str:
+    values = ", ".join(f"{format_fact_value(item['value'])}={item['count']}" for item in data.get("values", []))
+    nulls = data.get("null_count")
+    null_text = f", nulls={nulls}" if nulls not in (None, 0) else ""
+    return f"value_domain {data['column']}: {values}; distinct={data.get('distinct')}{null_text}."
+
+
+def render_column_group_fact(data: dict[str, Any]) -> str:
+    columns: list[str] = []
+    for column in data.get("columns", []):
+        bits = [column["column"], column["type"], column["role"]]
+        if column.get("distinct") is not None:
+            bits.append(f"distinct={column['distinct']}")
+        if column.get("top_values"):
+            values = "/".join(f"{format_fact_value(item['value'])}:{item['count']}" for item in column["top_values"][:5])
+            bits.append(f"values={values}")
+        columns.append(" ".join(bits))
+    return f"column_group {data['group']} count={data['column_count']}: " + "; ".join(columns) + "."
+
+
+def render_relationship_card(data: dict[str, Any]) -> str:
+    refs = ", ".join(f"{fk['column']}->{fk['references']}" for fk in data.get("foreign_keys", []))
+    return f"relationships {data['table']}: {refs}."
+
+
+def render_relationship_communities_card(data: dict[str, Any]) -> str:
+    communities = []
+    for index, community in enumerate(data.get("communities", []), start=1):
+        communities.append(f"community{index}({', '.join(community['tables'])})")
+    return "relationship_communities: " + "; ".join(communities) + "."
+
+
+def format_fact_value(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    text = str(value)
+    if not text:
+        return "<empty>"
+    if re.search(r"\s", text):
+        return repr(text)
+    return text

@@ -6,6 +6,7 @@ from typing import Any
 from .connectors.postgres import PostgresConnector, PostgresIntrospector
 from .connectors.sqlite import SQLiteConnector, SQLiteIntrospector
 from .detect import detect_project
+from .facts import facts_from_pills
 from .graph import ContextGraph
 from .models import InspectionResult, SnapshotOptions, Source
 from .snapshot import build_artifact
@@ -63,15 +64,18 @@ def refresh_snapshot(
         timeout_seconds=options.timeout_seconds,
     )
     try:
+        row_facts: list[dict[str, Any]] = []
         if inspection is None:
-            inspection, profiles = _inspect_and_profile(
+            inspection, profiles, row_facts = _inspect_profile_and_facts(
                 source,
                 options,
+                run,
                 introspector=introspector,
                 include_profiles=True,
             )
         nodes, edges, pills = build_artifact(source, run, inspection, profiles)
-        store.replace_artifact(source.id, run.id, nodes, edges, pills)
+        facts = facts_from_pills(pills) + row_facts
+        store.replace_artifact(source.id, run.id, nodes, edges, pills, facts=facts)
         run = store.finish_snapshot_run(
             run.id,
             "success",
@@ -79,6 +83,7 @@ def refresh_snapshot(
                 "nodes": len(nodes),
                 "edges": len(edges),
                 "pills": len(pills),
+                "facts": len(facts),
                 "database": inspection.database,
             },
         )
@@ -87,6 +92,7 @@ def refresh_snapshot(
             "nodes": len(nodes),
             "edges": len(edges),
             "pills": len(pills),
+            "facts": len(facts),
         }
     except Exception as exc:
         store.finish_snapshot_run(run.id, "failed", error=str(exc))
@@ -141,6 +147,23 @@ def _inspect_and_profile(
     introspector: Any | None = None,
     include_profiles: bool = True,
 ) -> tuple[InspectionResult, dict[tuple[str, str], Any] | None]:
+    inspection, profiles, _facts = _inspect_profile_and_facts(
+        source,
+        options,
+        run=None,
+        introspector=introspector,
+        include_profiles=include_profiles,
+    )
+    return inspection, profiles
+
+
+def _inspect_profile_and_facts(
+    source: Source,
+    options: SnapshotOptions,
+    run: Any | None,
+    introspector: Any | None = None,
+    include_profiles: bool = True,
+) -> tuple[InspectionResult, dict[tuple[str, str], Any] | None, list[dict[str, Any]]]:
     if source.connector_type == "postgres":
         if not source.dsn_env:
             raise ValueError(f"Postgres source {source.name} is missing dsn_env")
@@ -157,7 +180,12 @@ def _inspect_and_profile(
     with connector.connect() as conn:
         inspection = active_introspector.inspect(conn)
         profiles = active_introspector.profile(conn, inspection, options) if include_profiles else None
-    return inspection, profiles
+        row_facts = (
+            active_introspector.derive_facts(conn, source, run, inspection, options)
+            if run is not None and include_profiles and hasattr(active_introspector, "derive_facts")
+            else []
+        )
+    return inspection, profiles, row_facts
 
 
 def inspection_to_dict(inspection: InspectionResult) -> dict[str, Any]:

@@ -71,7 +71,7 @@ class MCPServer:
             },
             {
                 "name": "inspect_source",
-                "description": "Inspect a registered source using a read-only connection.",
+                "description": "Inspect live source schema through a read-only connection; use query_context for answering from snapshots.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -99,7 +99,7 @@ class MCPServer:
             },
             {
                 "name": "query_context",
-                "description": "Query the local artifact only; does not execute SQL.",
+                "description": "Answer from the local snapshot fact index first; does not execute SQL or contact the live source.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

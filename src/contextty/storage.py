@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from .facts import facts_from_pills, hashed_vector, prepare_fact_for_storage, tokenize, vector_similarity
 from .models import SnapshotRun, Source
 
 DEFAULT_STORE_PATH = Path(".contextty") / "contextty.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def default_store_path() -> Path:
@@ -111,6 +113,19 @@ class LocalStore:
                     rendered_text TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS facts (
+                    id TEXT PRIMARY KEY,
+                    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    snapshot_run_id INTEGER NOT NULL REFERENCES snapshot_runs(id) ON DELETE CASCADE,
+                    node_id TEXT,
+                    kind TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    data_json TEXT NOT NULL DEFAULT '{}',
+                    search_text TEXT NOT NULL,
+                    vector_json TEXT NOT NULL DEFAULT '[]'
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_snapshot_runs_source
                     ON snapshot_runs(source_id, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_nodes_latest
@@ -123,12 +138,23 @@ class LocalStore:
                     ON edges(source_id, snapshot_run_id, to_node_id);
                 CREATE INDEX IF NOT EXISTS idx_pills_node
                     ON pills(source_id, snapshot_run_id, node_id);
+                CREATE INDEX IF NOT EXISTS idx_facts_latest
+                    ON facts(source_id, snapshot_run_id, kind);
                 """
             )
+            self._ensure_facts_fts(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
             )
+
+    @staticmethod
+    def _ensure_facts_fts(conn: sqlite3.Connection) -> bool:
+        try:
+            conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(fact_id UNINDEXED, search_text)")
+            return True
+        except sqlite3.OperationalError:
+            return False
 
     def add_source(
         self,
@@ -250,8 +276,18 @@ class LocalStore:
         nodes: Iterable[dict[str, Any]],
         edges: Iterable[dict[str, Any]],
         pills: Iterable[dict[str, Any]],
+        facts: Iterable[dict[str, Any]] | None = None,
     ) -> None:
+        node_rows = list(nodes)
+        edge_rows = list(edges)
+        pill_rows = list(pills)
+        fact_rows = [prepare_fact_for_storage(fact) for fact in facts] if facts is not None else facts_from_pills(pill_rows)
         with self.connect() as conn:
+            self._delete_facts_fts(conn, source_id)
+            conn.execute(
+                "DELETE FROM facts WHERE source_id = ?",
+                (source_id,),
+            )
             conn.execute(
                 "DELETE FROM pills WHERE source_id = ?",
                 (source_id,),
@@ -275,7 +311,7 @@ class LocalStore:
                     :parent_id, :summary, :properties_json
                 )
                 """,
-                list(nodes),
+                node_rows,
             )
             conn.executemany(
                 """
@@ -286,7 +322,7 @@ class LocalStore:
                     :source_id, :snapshot_run_id, :from_node_id, :to_node_id, :relation, :properties_json
                 )
                 """,
-                list(edges),
+                edge_rows,
             )
             conn.executemany(
                 """
@@ -297,8 +333,47 @@ class LocalStore:
                     :id, :source_id, :snapshot_run_id, :node_id, :kind, :title, :json, :rendered_text
                 )
                 """,
-                list(pills),
+                pill_rows,
             )
+            conn.executemany(
+                """
+                INSERT INTO facts(
+                    id, source_id, snapshot_run_id, node_id, kind, subject, text,
+                    data_json, search_text, vector_json
+                )
+                VALUES (
+                    :id, :source_id, :snapshot_run_id, :node_id, :kind, :subject, :text,
+                    :data_json, :search_text, :vector_json
+                )
+                """,
+                fact_rows,
+            )
+            self._insert_facts_fts(conn, fact_rows)
+
+    @staticmethod
+    def _delete_facts_fts(conn: sqlite3.Connection, source_id: int) -> None:
+        try:
+            conn.execute(
+                """
+                DELETE FROM facts_fts
+                WHERE fact_id IN (SELECT id FROM facts WHERE source_id = ?)
+                """,
+                (source_id,),
+            )
+        except sqlite3.OperationalError:
+            return
+
+    @staticmethod
+    def _insert_facts_fts(conn: sqlite3.Connection, facts: list[dict[str, Any]]) -> None:
+        if not facts:
+            return
+        try:
+            conn.executemany(
+                "INSERT INTO facts_fts(fact_id, search_text) VALUES (?, ?)",
+                [(fact["id"], fact["search_text"]) for fact in facts],
+            )
+        except sqlite3.OperationalError:
+            return
 
     def get_nodes(
         self,
@@ -353,10 +428,106 @@ class LocalStore:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_pill(row) for row in rows]
 
+    def get_facts(
+        self,
+        source_id: int | None = None,
+        snapshot_run_id: int | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        run = self._resolve_run(source_id, snapshot_run_id)
+        if run is None:
+            return []
+        query = "SELECT * FROM facts WHERE snapshot_run_id = ?"
+        params: list[Any] = [run.id]
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        query += " ORDER BY kind, subject"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_fact(row) for row in rows]
+
+    def search_facts(
+        self,
+        query: str,
+        source_id: int | None = None,
+        snapshot_run_id: int | None = None,
+        limit: int = 16,
+    ) -> list[dict[str, Any]]:
+        run = self._resolve_run(source_id, snapshot_run_id)
+        if run is None:
+            return []
+        facts = self.get_facts(snapshot_run_id=run.id)
+        if not facts:
+            return []
+
+        fts_scores = self._search_facts_fts(query, run.id, limit=max(limit * 8, 64))
+        query_tokens = set(tokenize(query))
+        query_vector = hashed_vector(query)
+        scored: list[tuple[dict[str, Any], float]] = []
+        normalized_query = " ".join(query.lower().split())
+        for fact in facts:
+            search_text = fact.get("search_text") or fact.get("text") or ""
+            fact_tokens = set(tokenize(search_text))
+            overlap = query_tokens.intersection(fact_tokens)
+            vector = fact.get("vector") if isinstance(fact.get("vector"), list) else []
+            score = len(overlap) * 8.0
+            score += vector_similarity(query_vector, vector) * 6.0
+            if fact["id"] in fts_scores:
+                score += 5.0 + fts_scores[fact["id"]]
+            if normalized_query and normalized_query in search_text.lower():
+                score += 8.0
+            for phrase in quoted_phrases(query):
+                if phrase.lower() in search_text.lower():
+                    score += 12.0
+            if score > 0:
+                ranked = dict(fact)
+                ranked["score"] = round(score, 6)
+                scored.append((ranked, score))
+        scored.sort(key=lambda item: (-item[1], item[0]["kind"], item[0]["subject"]))
+        return [fact for fact, _score in scored[:limit]]
+
+    def _search_facts_fts(self, query: str, snapshot_run_id: int, limit: int) -> dict[str, float]:
+        fts_query = fts_query_for(query)
+        if not fts_query:
+            return {}
+        try:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT f.id, bm25(facts_fts) AS rank
+                    FROM facts_fts
+                    JOIN facts f ON f.id = facts_fts.fact_id
+                    WHERE facts_fts MATCH ?
+                      AND f.snapshot_run_id = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, snapshot_run_id, limit),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        scores: dict[str, float] = {}
+        for row in rows:
+            rank = row["rank"]
+            scores[row["id"]] = 1.0 / (1.0 + abs(float(rank or 0.0)))
+        return scores
+
     def get_node(self, node_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         return self._row_to_node(row) if row is not None else None
+
+    def resolve_snapshot_run(
+        self,
+        source_id: int | None = None,
+        snapshot_run_id: int | None = None,
+    ) -> SnapshotRun | None:
+        return self._resolve_run(source_id, snapshot_run_id)
 
     def source_for_run(self, run_id: int) -> Source:
         with self.connect() as conn:
@@ -453,3 +624,32 @@ class LocalStore:
             "json": loads_json(row["json"]),
             "rendered_text": row["rendered_text"],
         }
+
+    @staticmethod
+    def _row_to_fact(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "source_id": row["source_id"],
+            "snapshot_run_id": row["snapshot_run_id"],
+            "node_id": row["node_id"],
+            "kind": row["kind"],
+            "subject": row["subject"],
+            "text": row["text"],
+            "data": loads_json(row["data_json"]),
+            "search_text": row["search_text"],
+            "vector": loads_json(row["vector_json"]),
+        }
+
+
+def quoted_phrases(query: str) -> list[str]:
+    return [match.group(1) or match.group(2) for match in re.finditer(r"'([^']+)'|\"([^\"]+)\"", query)]
+
+
+def fts_query_for(query: str) -> str:
+    tokens = []
+    for token in tokenize(query):
+        if re.fullmatch(r"[A-Za-z0-9_]+", token):
+            tokens.append(token)
+        if len(tokens) >= 12:
+            break
+    return " OR ".join(f"{token}*" for token in tokens)

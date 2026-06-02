@@ -1,21 +1,45 @@
 # Contextty
 
-Give AI agents a local map of your database without giving them the database.
+Give AI agents a local, database-agnostic map of your data sources without
+giving them the database.
 
-Contextty turns approved PostgreSQL and SQLite sources into local,
-AI-readable context artifacts. It captures schema metadata, relationship
-graphs, and bounded profiling summaries so agents can answer database
-structure questions through the CLI, HTTP API, or MCP without querying the live
-database during normal context lookup.
+Contextty turns approved database sources into local, AI-readable context
+artifacts through isolated connectors. It captures schema metadata,
+relationship graphs, bounded profiling summaries, and compact answer facts so
+agents can answer common data questions through the CLI, HTTP API, or MCP
+without querying live sources during normal context lookup.
 
 ## Why Contextty
 
+- Database-agnostic connector architecture: isolate each source type's
+  connection, introspection, SQL dialect, and profiling behavior behind a
+  dedicated connector.
 - Local snapshots: build a `.contextty/contextty.db` artifact that agents can
-  query without live database access.
-- Connector-based sources: keep PostgreSQL and SQLite connection,
-  introspection, SQL dialect, and profiling behavior isolated by connector.
+  query without live source access.
 - Read-only, bounded access: inspect and snapshot operations use read-only
   connections, SQL guardrails, statement timeouts, and row limits.
+- CLI, API, and MCP access: expose the same registered sources and local
+  context artifacts through terminal commands, HTTP endpoints, and MCP tools.
+
+## Benefits For AI Agents
+
+Contextty gives agents local database awareness without handing them
+production credentials or requiring repeated live SQL queries for normal
+context lookup. The artifact is a semantic/context snapshot, not a compressed
+database copy, backup, or table dump.
+
+- Lightweight context: captures schema, relationships, indexes, views, and
+  bounded profile summaries in an AI-readable local artifact.
+- Safer default workflow: agents query the local artifact after refresh instead
+  of connecting to the live database for every context question.
+- Token-efficient retrieval: a local fact index answers common questions first,
+  with graph search and word-budgeted rendering as fallback context.
+- Lower database load: context lookup is local after an approved snapshot
+  refresh.
+- Relationship-aware answers: connected tables, columns, foreign keys, and
+  indexes stay available as graph context.
+- Connector-neutral output: supported databases render into the same local
+  context model.
 
 ## Quickstart
 
@@ -31,15 +55,16 @@ Detect database sources in a project:
 contextty detect .
 ```
 
-Register an approved PostgreSQL source whose DSN is stored in an environment
-variable:
+Register an approved source with the connector and locator fields for that
+database type. For example, a source whose connector reads a DSN from an
+environment variable:
 
 ```bash
 export DATABASE_URL='postgresql://user:pass@localhost:5432/app'
 contextty source add app-db --type postgres --dsn-env DATABASE_URL
 ```
 
-Register a local SQLite database file:
+Or a source whose connector reads a local database file:
 
 ```bash
 contextty source add local-db --type sqlite --path ./app.sqlite3
@@ -68,8 +93,8 @@ contextty serve --mcp
 
 ## What Contextty Captures
 
-Contextty snapshots are database context, not database backups. A snapshot can
-include:
+Contextty snapshots are database context, not database backups or compressed
+database copies. A snapshot can include:
 
 - Schemas, tables, views, and view definitions.
 - Columns, data types, nullability, and defaults.
@@ -77,19 +102,23 @@ include:
 - Database, schema, table, view, column, index, and relationship graph nodes.
 - Context pills that summarize useful local facts for AI agents.
 - Basic profiling summaries, with optional deep profiling over a bounded row
-  sample.
+  sample that can include sampled or top values.
+- A local fact index backed by lexical lookup and deterministic vector
+  reranking. Deep snapshots can add bounded row-derived facts such as entity
+  labels, foreign-key relationships, bridge assignments, latest metrics, and
+  low-risk grouped aggregates.
 
-After a snapshot is built, `contextty query` searches the local graph artifact,
-ranks matching nodes, follows nearby graph edges, and renders context within
-the requested word budget.
+After a snapshot is built, `contextty query` searches the local fact index
+first. If no answer-ready fact matches, it falls back to compact graph context
+with the involved tables and columns.
 
-## Supported Sources
+## Current Connectors
 
-| Database source | Status | Registration | Notes |
+| Connector | Status | Registration | Notes |
 | --- | --- | --- | --- |
 | PostgreSQL | Available now | `--type postgres --dsn-env DATABASE_URL` | Connects through a DSN stored in an environment variable. |
 | SQLite | Available now | `--type sqlite --path ./app.sqlite3` | Connects to a local SQLite database file. |
-| Future connectors | Connector model ready | Connector-specific fields | New database types should live in dedicated connector modules with isolated dialect logic. |
+| Future connectors | Connector model ready | Connector-specific fields | New database types live in dedicated connector modules with isolated dialect logic. |
 
 ## Use Contextty From
 
@@ -107,16 +136,24 @@ the requested word budget.
 Contextty is built around approved sources and local artifacts:
 
 - Sources must be registered before inspection or snapshot refresh.
+- Initial inspection and snapshot refresh still require approved read-only
+  access to the source.
 - Connectors default to read-only database access.
 - User-provided SQL goes through the shared read-only guard before execution.
 - Connection waits and query execution are bounded with timeouts.
 - Profiling is bounded by `SnapshotOptions.row_limit`.
+- Row-derived facts are capped and truncated; Contextty does not store full row
+  blobs or arbitrary table replicas.
 - `contextty query` reads the local snapshot only; it does not execute SQL
   against the live database.
+- Snapshots can become stale until they are refreshed.
+- Deep profiling can store sampled or top values in the artifact, so access to
+  `.contextty/contextty.db` should still be treated as sensitive.
 
 ## Command Reference
 
-These commands cover the common PostgreSQL and SQLite workflows:
+These commands cover source registration and snapshot workflows. The source
+registration examples use currently available connectors:
 
 ```bash
 contextty detect .
@@ -131,9 +168,9 @@ contextty serve --mcp
 
 | Command | What it does |
 | --- | --- |
-| `contextty detect .` | Recursively scans the current project for likely PostgreSQL connection configuration and verified SQLite database files. |
-| `contextty source add app-db --type postgres --dsn-env DATABASE_URL` | Registers or updates a source named `app-db` that uses the PostgreSQL connector and reads its DSN from `DATABASE_URL`. |
-| `contextty source add local-db --type sqlite --path ./app.sqlite3` | Registers or updates a source named `local-db` that uses the SQLite connector and reads `./app.sqlite3` directly. |
+| `contextty detect .` | Recursively scans the current project for likely database sources and verifies candidates before returning them. |
+| `contextty source add app-db --type postgres --dsn-env DATABASE_URL` | Registers or updates a source named `app-db` using the connector and locator fields shown in the command. |
+| `contextty source add local-db --type sqlite --path ./app.sqlite3` | Registers or updates a source named `local-db` using the connector and locator fields shown in the command. |
 | `contextty source list` | Lists registered sources from the local Contextty store. |
 | `contextty inspect app-db` | Connects to the registered source and returns schema metadata without writing a snapshot. |
 | `contextty snapshot app-db --profile-mode deep --row-limit 10000 --timeout 5s` | Builds or refreshes the local graph artifact for `app-db` using deep profiling, up to 10,000 sampled rows, and a 5 second statement timeout. |

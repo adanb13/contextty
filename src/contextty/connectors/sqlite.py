@@ -8,6 +8,7 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 from .common import text_patterns
+from ..facts import MAX_SOURCE_ROWS_PER_TABLE, build_row_facts, sample_columns_for_table
 from ..models import (
     ColumnInfo,
     ColumnProfile,
@@ -16,6 +17,8 @@ from ..models import (
     InspectionResult,
     PrimaryKeyInfo,
     SnapshotOptions,
+    SnapshotRun,
+    Source,
     TableInfo,
     TableProfile,
     ViewInfo,
@@ -146,6 +149,29 @@ class SQLiteIntrospector:
         validate_readonly_sql(sql)
         return self._fetchall(conn, sql)
 
+    def derive_facts(
+        self,
+        conn: sqlite3.Connection,
+        source: Source,
+        run: SnapshotRun,
+        inspection: InspectionResult,
+        options: SnapshotOptions,
+    ) -> list[dict[str, Any]]:
+        if options.profile_mode != "deep":
+            return []
+        rows_by_table: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        limit = max(0, min(options.row_limit, MAX_SOURCE_ROWS_PER_TABLE))
+        if limit <= 0:
+            return []
+        for table in inspection.tables:
+            if table.kind != "table":
+                continue
+            columns = sample_columns_for_table(inspection, table)
+            if not columns:
+                continue
+            rows_by_table[(table.schema, table.name)] = self._sample_rows(conn, table, columns, limit)
+        return build_row_facts(source, run, inspection, rows_by_table, options)
+
     def _table_columns(self, conn: sqlite3.Connection, database: str, table: str) -> list[tuple[ColumnInfo, int]]:
         rows = self._fetchall(conn, f"PRAGMA table_xinfo({quote_string(table)})")
         columns: list[tuple[ColumnInfo, int]] = []
@@ -206,6 +232,21 @@ class SQLiteIntrospector:
                 )
             )
         return indexes
+
+    def _sample_rows(
+        self,
+        conn: sqlite3.Connection,
+        table: TableInfo,
+        columns: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        table_name = qualified_table(table.schema, table.name)
+        column_sql = ", ".join(quote_ident(column) for column in columns)
+        return self._fetchall(
+            conn,
+            f"SELECT {column_sql} FROM {table_name} LIMIT ?",
+            (limit,),
+        )
 
     def _profile_table(
         self,

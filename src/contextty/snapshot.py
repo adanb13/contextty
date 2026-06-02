@@ -65,9 +65,9 @@ class ArtifactBuilder:
         db_id = make_node_id("database", self.source.name, self.inspection.database)
         self._db_id = db_id
         source_properties = {"connector_type": self.source.connector_type}
-        if self.source.connector_type == "postgres":
+        if self.source.dsn_env:
             source_properties["dsn_env"] = self.source.dsn_env
-        elif self.source.connector_type == "sqlite":
+        if self.source.path:
             source_properties["path"] = self.source.path
         self._add_node(source_id, "source", self.source.name, self.source.name, None, "Registered source", source_properties)
         self._add_node(db_id, "database", self.inspection.database, self.inspection.database, source_id, None, {})

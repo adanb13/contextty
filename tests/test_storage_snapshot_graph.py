@@ -16,15 +16,56 @@ def test_source_storage_uses_connector_specific_locator_fields(tmp_path) -> None
 
     postgres = store.add_source("pg-db", "postgres", dsn_env="DATABASE_URL")
     sqlite = store.add_source("local-db", "sqlite", path=sqlite_path)
+    mysql = store.add_source("mysql-db", "mysql", dsn_env="MYSQL_DATABASE_URL")
+    mariadb = store.add_source("mariadb-db", "mariadb", dsn_env="MARIADB_DATABASE_URL")
+    duckdb = store.add_source("duckdb-db", "duckdb", path=tmp_path / "analytics.duckdb")
 
     assert postgres.dsn_env == "DATABASE_URL"
     assert postgres.path is None
     assert sqlite.dsn_env is None
     assert sqlite.path and sqlite.path.endswith("app.sqlite3")
+    assert mysql.dsn_env == "MYSQL_DATABASE_URL"
+    assert mysql.path is None
+    assert mariadb.dsn_env == "MARIADB_DATABASE_URL"
+    assert mariadb.path is None
+    assert duckdb.dsn_env is None
+    assert duckdb.path and duckdb.path.endswith("analytics.duckdb")
 
     with store.connect() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
     assert {"connector_type", "dsn_env", "path"} <= columns
+
+
+def test_existing_store_migrates_source_connector_check(tmp_path) -> None:
+    store_path = tmp_path / "contextty.db"
+    with sqlite3.connect(store_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                connector_type TEXT NOT NULL CHECK (connector_type IN ('postgres', 'sqlite')),
+                dsn_env TEXT,
+                path TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO sources(name, connector_type, dsn_env, path)
+            VALUES ('pg-db', 'postgres', 'DATABASE_URL', NULL);
+            """
+        )
+
+    store = LocalStore(store_path)
+    store.add_source("mysql-db", "mysql", dsn_env="MYSQL_DATABASE_URL")
+    store.add_source("mariadb-db", "mariadb", dsn_env="MARIADB_DATABASE_URL")
+    store.add_source("duckdb-db", "duckdb", path=tmp_path / "analytics.duckdb")
+
+    assert {source.connector_type for source in store.list_sources()} == {"postgres", "mysql", "mariadb", "duckdb"}
 
 
 def test_snapshot_artifact_contains_expected_nodes_edges_and_pills(tmp_path) -> None:

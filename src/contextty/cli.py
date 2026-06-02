@@ -11,7 +11,7 @@ import click
 from .api import create_app
 from .connectors.common import parse_timeout
 from .mcp_server import MCPServer
-from .models import SnapshotOptions
+from .models import CONNECTOR_TYPES, SnapshotOptions
 from .services import (
     add_source,
     detect,
@@ -80,9 +80,9 @@ def source_group() -> None:
 
 @source_group.command("add")
 @click.argument("name")
-@click.option("--type", "connector_type", required=True, type=click.Choice(["postgres", "sqlite"]), help="Connector type.")
-@click.option("--dsn-env", default=None, help="Environment variable containing the Postgres DSN.")
-@click.option("--path", "source_path", default=None, type=click.Path(), help="SQLite database path.")
+@click.option("--type", "connector_type", required=True, type=click.Choice(CONNECTOR_TYPES), help="Connector type.")
+@click.option("--dsn-env", default=None, help="Environment variable containing a network database DSN.")
+@click.option("--path", "source_path", default=None, type=click.Path(), help="Local database path.")
 def source_add_cmd(name: str, connector_type: str, dsn_env: str | None, source_path: str | None) -> None:
     """Register or update a source."""
     try:
@@ -190,8 +190,14 @@ def _detect_interactive() -> bool:
 def _candidate_label(candidate: dict[str, Any]) -> str:
     if candidate["connector_type"] == "postgres":
         return f"Postgres source from {candidate.get('dsn_env')}"
+    if candidate["connector_type"] == "mysql":
+        return f"MySQL source from {candidate.get('dsn_env')}"
+    if candidate["connector_type"] == "mariadb":
+        return f"MariaDB source from {candidate.get('dsn_env')}"
     if candidate["connector_type"] == "sqlite":
         return f"SQLite source at {candidate.get('path')}"
+    if candidate["connector_type"] == "duckdb":
+        return f"DuckDB source at {candidate.get('path')}"
     return f"{candidate['connector_type']} source"
 
 

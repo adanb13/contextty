@@ -3,8 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from .connectors.postgres import PostgresConnector, PostgresIntrospector
-from .connectors.sqlite import SQLiteConnector, SQLiteIntrospector
+from .connectors.registry import connector_for_source
 from .detect import detect_project
 from .facts import facts_from_pills
 from .graph import ContextGraph
@@ -164,18 +163,7 @@ def _inspect_profile_and_facts(
     introspector: Any | None = None,
     include_profiles: bool = True,
 ) -> tuple[InspectionResult, dict[tuple[str, str], Any] | None, list[dict[str, Any]]]:
-    if source.connector_type == "postgres":
-        if not source.dsn_env:
-            raise ValueError(f"Postgres source {source.name} is missing dsn_env")
-        active_introspector = introspector or PostgresIntrospector()
-        connector = PostgresConnector.from_env(source.dsn_env, timeout_seconds=options.timeout_seconds)
-    elif source.connector_type == "sqlite":
-        if not source.path:
-            raise ValueError(f"SQLite source {source.name} is missing path")
-        active_introspector = introspector or SQLiteIntrospector(timeout_seconds=options.timeout_seconds)
-        connector = SQLiteConnector(source.path, timeout_seconds=options.timeout_seconds)
-    else:
-        raise ValueError(f"unsupported connector type: {source.connector_type}")
+    connector, active_introspector = connector_for_source(source, options, introspector=introspector)
 
     with connector.connect() as conn:
         inspection = active_introspector.inspect(conn)

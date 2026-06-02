@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from .facts import facts_from_pills, hashed_vector, prepare_fact_for_storage, tokenize, vector_similarity
-from .models import SnapshotRun, Source
+from .models import CONNECTOR_TYPES, DSN_ENV_CONNECTOR_TYPES, PATH_CONNECTOR_TYPES, SnapshotRun, Source
 
 DEFAULT_STORE_PATH = Path(".contextty") / "contextty.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+CONNECTOR_TYPE_SQL = ", ".join(f"'{connector_type}'" for connector_type in CONNECTOR_TYPES)
 
 
 def default_store_path() -> Path:
@@ -59,7 +60,7 @@ class LocalStore:
                 CREATE TABLE IF NOT EXISTS sources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
-                    connector_type TEXT NOT NULL CHECK (connector_type IN ('postgres', 'sqlite')),
+                    connector_type TEXT NOT NULL CHECK (connector_type IN ('postgres', 'sqlite', 'mysql', 'mariadb', 'duckdb')),
                     dsn_env TEXT,
                     path TEXT,
                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -142,11 +143,44 @@ class LocalStore:
                     ON facts(source_id, snapshot_run_id, kind);
                 """
             )
+            conn.commit()
+            self._ensure_sources_connector_type_check(conn)
             self._ensure_facts_fts(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
             )
+
+    @staticmethod
+    def _ensure_sources_connector_type_check(conn: sqlite3.Connection) -> None:
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'").fetchone()
+        table_sql = row["sql"] if row else ""
+        if all(f"'{connector_type}'" in table_sql for connector_type in CONNECTOR_TYPES):
+            return
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
+            f"""
+            CREATE TABLE sources_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                connector_type TEXT NOT NULL CHECK (connector_type IN ({CONNECTOR_TYPE_SQL})),
+                dsn_env TEXT,
+                path TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                metadata_json TEXT NOT NULL DEFAULT '{{}}'
+            );
+
+            INSERT INTO sources_new(id, name, connector_type, dsn_env, path, created_at, updated_at, metadata_json)
+            SELECT id, name, connector_type, dsn_env, path, created_at, updated_at, metadata_json
+            FROM sources;
+
+            DROP TABLE sources;
+            ALTER TABLE sources_new RENAME TO sources;
+            """
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _ensure_facts_fts(conn: sqlite3.Connection) -> bool:
@@ -164,18 +198,18 @@ class LocalStore:
         path: str | os.PathLike[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Source:
-        if connector_type == "postgres":
+        if connector_type in DSN_ENV_CONNECTOR_TYPES:
             if not dsn_env:
-                raise ValueError("Postgres sources require dsn_env")
+                raise ValueError(f"{connector_type} sources require dsn_env")
             path_value = None
             dsn_env_value: str | None = dsn_env
-        elif connector_type == "sqlite":
+        elif connector_type in PATH_CONNECTOR_TYPES:
             if not path:
-                raise ValueError("SQLite sources require path")
+                raise ValueError(f"{connector_type} sources require path")
             path_value = str(Path(path).expanduser().resolve())
             dsn_env_value = None
         else:
-            raise ValueError("connector_type must be one of: postgres, sqlite")
+            raise ValueError(f"connector_type must be one of: {', '.join(CONNECTOR_TYPES)}")
         metadata = metadata or {}
         with self.connect() as conn:
             conn.execute(

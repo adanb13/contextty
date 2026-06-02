@@ -148,8 +148,9 @@ rendering strategy, and shared CLI, API, and MCP query behavior.
 Contextty uses deterministic indexing and retrieval strategies rather than
 model-trained embeddings or live database queries during normal context lookup.
 
-- **Source detection:** scans known environment/config files for Postgres DSN
-  variables and verifies SQLite database files with read-only probes.
+- **Source detection:** scans known environment/config files for Postgres,
+  MySQL, and MariaDB DSN variables and verifies SQLite and DuckDB database
+  files with read-only probes.
 - **Bounded profiling:** samples up to the configured row limit to compute row
   counts, null rates, distinct counts, min/max values, top values, text
   patterns, and time windows.
@@ -180,6 +181,9 @@ model-trained embeddings or live database queries during normal context lookup.
 | --- | --- | --- | --- |
 | PostgreSQL | Available now | `--type postgres --dsn-env DATABASE_URL` | Connects through a DSN stored in an environment variable. |
 | SQLite | Available now | `--type sqlite --path ./app.sqlite3` | Connects to a local SQLite database file. |
+| MySQL | Available now | `contextty source add app-db --type mysql --dsn-env MYSQL_DATABASE_URL` | Connects through a DSN stored in an environment variable using PyMySQL. |
+| MariaDB | Available now | `contextty source add app-db --type mariadb --dsn-env MARIADB_DATABASE_URL` | Connects through a DSN stored in an environment variable using PyMySQL. |
+| DuckDB | Available now | `contextty source add analytics-db --type duckdb --path ./analytics.duckdb` | Opens local `.duckdb` and `.ddb` files read-only. |
 | Future connectors | Connector model ready | Connector-specific fields | New database types live in dedicated connector modules with isolated dialect logic. |
 
 ## Use Contextty From
@@ -221,6 +225,9 @@ registration examples use currently available connectors:
 contextty detect .
 contextty source add app-db --type postgres --dsn-env DATABASE_URL
 contextty source add local-db --type sqlite --path ./app.sqlite3
+contextty source add app-db --type mysql --dsn-env MYSQL_DATABASE_URL
+contextty source add app-db --type mariadb --dsn-env MARIADB_DATABASE_URL
+contextty source add analytics-db --type duckdb --path ./analytics.duckdb
 contextty inspect app-db
 contextty snapshot app-db --profile-mode deep --row-limit 10000 --timeout 5s
 contextty query "what tables explain signup state?" --source app-db --budget 2000
@@ -233,6 +240,9 @@ contextty serve --mcp
 | `contextty detect .` | Recursively scans the current project for likely database sources and verifies candidates before returning them. |
 | `contextty source add app-db --type postgres --dsn-env DATABASE_URL` | Registers or updates a source named `app-db` using the connector and locator fields shown in the command. |
 | `contextty source add local-db --type sqlite --path ./app.sqlite3` | Registers or updates a source named `local-db` using the connector and locator fields shown in the command. |
+| `contextty source add app-db --type mysql --dsn-env MYSQL_DATABASE_URL` | Registers or updates a MySQL source whose DSN is read from an environment variable. |
+| `contextty source add app-db --type mariadb --dsn-env MARIADB_DATABASE_URL` | Registers or updates a MariaDB source whose DSN is read from an environment variable. |
+| `contextty source add analytics-db --type duckdb --path ./analytics.duckdb` | Registers or updates a DuckDB source opened from a local database file. |
 | `contextty source list` | Lists registered sources from the local Contextty store. |
 | `contextty inspect app-db` | Connects to the registered source and returns schema metadata without writing a snapshot. |
 | `contextty snapshot app-db --profile-mode deep --row-limit 10000 --timeout 5s` | Builds or refreshes the local graph artifact for `app-db` using deep profiling, up to 10,000 sampled rows, and a 5 second statement timeout. |

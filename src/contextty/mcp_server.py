@@ -5,7 +5,7 @@ import sys
 from typing import Any, Callable
 
 from .connectors.common import parse_timeout
-from .models import SnapshotOptions
+from .models import CONNECTOR_TYPES, SnapshotOptions
 from .services import (
     add_source,
     detect,
@@ -39,7 +39,7 @@ class MCPServer:
         return [
             {
                 "name": "detect_sources",
-                "description": "Detect Postgres and SQLite sources under a project path.",
+                "description": "Detect supported database sources under a project path.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -55,7 +55,7 @@ class MCPServer:
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
-                        "type": {"type": "string", "enum": ["postgres", "sqlite"]},
+                        "type": {"type": "string", "enum": list(CONNECTOR_TYPES)},
                         "dsn_env": {"type": "string"},
                         "path": {"type": "string"},
                         "metadata": {"type": "object", "default": {}},

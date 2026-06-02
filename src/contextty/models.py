@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-ConnectorType = Literal["postgres", "sqlite"]
+CONNECTOR_TYPES = ("postgres", "sqlite", "mysql", "mariadb", "duckdb")
+DSN_ENV_CONNECTOR_TYPES = ("postgres", "mysql", "mariadb")
+PATH_CONNECTOR_TYPES = ("sqlite", "duckdb")
+
+ConnectorType = Literal["postgres", "sqlite", "mysql", "mariadb", "duckdb"]
 ProfileMode = Literal["basic", "deep"]
 
 

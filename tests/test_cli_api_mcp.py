@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from contextty.api import create_app
 from contextty.cli import main
+from contextty.detect import detect_project
 from contextty.mcp_server import MCPServer
 from contextty.storage import LocalStore
 
@@ -81,7 +82,7 @@ def test_cli_sqlite_source_add_inspect_snapshot_and_query(tmp_path) -> None:
 
 
 def test_cli_detect_noninteractive_outputs_json_without_registering(tmp_path, monkeypatch) -> None:
-    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_DSN", "PG_DSN"):
+    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_DSN", "PG_DSN", "MYSQL_URL", "MYSQL_DATABASE_URL", "MYSQL_DSN", "MARIADB_URL", "MARIADB_DATABASE_URL", "MARIADB_DSN"):
         monkeypatch.delenv(name, raising=False)
     sqlite_fixture_db(tmp_path)
     (tmp_path / "not-a-database.db").write_text("not sqlite", encoding="utf-8")
@@ -101,7 +102,7 @@ def test_cli_detect_noninteractive_outputs_json_without_registering(tmp_path, mo
 
 
 def test_cli_detect_interactive_can_register_sqlite_source(tmp_path, monkeypatch) -> None:
-    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_DSN", "PG_DSN"):
+    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_DSN", "PG_DSN", "MYSQL_URL", "MYSQL_DATABASE_URL", "MYSQL_DSN", "MARIADB_URL", "MARIADB_DATABASE_URL", "MARIADB_DSN"):
         monkeypatch.delenv(name, raising=False)
     sqlite_fixture_db(tmp_path)
     store_path = tmp_path / "contextty.db"
@@ -118,6 +119,27 @@ def test_cli_detect_interactive_can_register_sqlite_source(tmp_path, monkeypatch
     source = LocalStore(store_path).get_source("local-db")
     assert source.connector_type == "sqlite"
     assert source.path and source.path.endswith("app.sqlite3")
+
+
+def test_detect_mysql_and_mariadb_env_names_and_url_schemes(tmp_path, monkeypatch) -> None:
+    for name in ("POSTGRES_URL", "POSTGRES_DSN", "PG_DSN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://user:pass@localhost/app")
+    monkeypatch.setenv("MYSQL_DATABASE_URL", "mysql://user:pass@localhost/app")
+    monkeypatch.setenv("MARIADB_DATABASE_URL", "mariadb://user:pass@localhost/app")
+    (tmp_path / ".env").write_text(
+        "REPORTING_URL=mariadb+pymysql://user:pass@localhost/reporting\nMYSQL_DSN=\n",
+        encoding="utf-8",
+    )
+
+    sources = detect_project(tmp_path)["sources"]
+    by_env = {source["dsn_env"]: source["connector_type"] for source in sources if source.get("dsn_env")}
+
+    assert by_env["DATABASE_URL"] == "mysql"
+    assert by_env["MYSQL_DATABASE_URL"] == "mysql"
+    assert by_env["MARIADB_DATABASE_URL"] == "mariadb"
+    assert by_env["REPORTING_URL"] == "mariadb"
+    assert by_env["MYSQL_DSN"] == "mysql"
 
 
 def test_api_sources_query_graph_and_node(tmp_path) -> None:
@@ -165,6 +187,37 @@ def test_api_sqlite_source_create_snapshot_and_query(tmp_path) -> None:
     assert "signup_state" in query.json()["context"]
 
 
+def test_cli_api_mcp_register_mysql_and_mariadb_sources(tmp_path) -> None:
+    store_path = tmp_path / "contextty.db"
+    runner = CliRunner()
+
+    mysql = runner.invoke(
+        main,
+        ["source", "add", "mysql-db", "--type", "mysql", "--dsn-env", "MYSQL_DATABASE_URL"],
+        env={"CONTEXTTY_STORE_PATH": str(store_path)},
+    )
+    assert mysql.exit_code == 0, mysql.output
+    assert json.loads(mysql.output)["connector_type"] == "mysql"
+
+    mariadb = runner.invoke(
+        main,
+        ["source", "add", "mariadb-db", "--type", "mariadb", "--dsn-env", "MARIADB_DATABASE_URL"],
+        env={"CONTEXTTY_STORE_PATH": str(store_path)},
+    )
+    assert mariadb.exit_code == 0, mariadb.output
+    assert json.loads(mariadb.output)["connector_type"] == "mariadb"
+
+    client = TestClient(create_app(LocalStore(tmp_path / "api.db")))
+    created = client.post("/v1/sources", json={"name": "mysql-db", "type": "mysql", "dsn_env": "MYSQL_DATABASE_URL"})
+    assert created.status_code == 200, created.text
+    assert created.json()["dsn_env"] == "MYSQL_DATABASE_URL"
+
+    server = MCPServer(LocalStore(tmp_path / "mcp.db"))
+    assert server.call_tool("add_source", {"name": "mariadb-db", "type": "mariadb", "dsn_env": "MARIADB_DATABASE_URL"})[
+        "connector_type"
+    ] == "mariadb"
+
+
 def test_mcp_tool_listing_and_query_context(tmp_path) -> None:
     store, _source = populated_store(tmp_path)
     server = MCPServer(store)
@@ -188,10 +241,12 @@ def test_mcp_tool_listing_and_query_context(tmp_path) -> None:
 
     rpc = server.handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     assert rpc and rpc["result"]["tools"]
+    add_source_tool = next(tool for tool in rpc["result"]["tools"] if tool["name"] == "add_source")
+    assert set(add_source_tool["inputSchema"]["properties"]["type"]["enum"]) >= {"mysql", "mariadb", "duckdb"}
 
 
 def test_mcp_sqlite_detect_add_snapshot_and_query(tmp_path, monkeypatch) -> None:
-    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_DSN", "PG_DSN"):
+    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRES_DSN", "PG_DSN", "MYSQL_URL", "MYSQL_DATABASE_URL", "MYSQL_DSN", "MARIADB_URL", "MARIADB_DATABASE_URL", "MARIADB_DSN"):
         monkeypatch.delenv(name, raising=False)
     db_path = sqlite_fixture_db(tmp_path)
     server = MCPServer(LocalStore(tmp_path / ".contextty" / "contextty.db"))

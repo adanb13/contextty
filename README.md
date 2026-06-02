@@ -143,6 +143,37 @@ source-specific inspection and profiling, while reusing the shared artifact
 builder, fact model, local fact index, graph traversal, answerability status,
 rendering strategy, and shared CLI, API, and MCP query behavior.
 
+## Algorithms And Retrieval Strategies
+
+Contextty uses deterministic indexing and retrieval strategies rather than
+model-trained embeddings or live database queries during normal context lookup.
+
+- **Source detection:** scans known environment/config files for Postgres DSN
+  variables and verifies SQLite database files with read-only probes.
+- **Bounded profiling:** samples up to the configured row limit to compute row
+  counts, null rates, distinct counts, min/max values, top values, text
+  patterns, and time windows.
+- **Graph construction:** models each snapshot as source, database, schema,
+  table, view, column, index, and context-pill nodes with edges for containment,
+  columns, indexes, summaries, and foreign-key relationships.
+- **Compact fact extraction:** converts schema, profiles, relationships, and
+  bounded sampled rows into answer-ready facts such as table inventories,
+  table schemas, value domains, relationship cards, entity labels, bridge
+  assignments, latest metrics, sums, and averages.
+- **Local fact search:** stores facts in SQLite with FTS5 when available, then
+  ranks matches using lexical overlap, phrase bonuses, schema routing hints,
+  and deterministic hashed-vector similarity.
+- **Schema routing:** matches query terms against table names, column names,
+  summaries, and foreign-key edges using token overlap and character n-gram
+  fuzzy matching.
+- **Graph traversal:** selects likely seed nodes and performs bounded traversal
+  over the local artifact graph to provide nearby schema and relationship
+  context.
+- **Answerability signaling:** returns `answered_by_snapshot` when local facts
+  are sufficient, `partial_context` when graph context may help, and
+  `needs_db_fallback` when a bounded snapshot cannot answer a row-level
+  question.
+
 ## Current Connectors
 
 | Connector | Status | Registration | Notes |

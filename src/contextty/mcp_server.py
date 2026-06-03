@@ -89,7 +89,7 @@ class MCPServer:
                     "type": "object",
                     "properties": {
                         "source": {"type": "string"},
-                        "profile_mode": {"type": "string", "enum": ["basic", "deep"], "default": "basic"},
+                        "profile_mode": {"type": "string", "enum": ["basic", "deep"], "default": "deep"},
                         "row_limit": {"type": "integer", "default": 1000},
                         "timeout": {"type": ["string", "number"], "default": "5s"},
                     },
@@ -233,7 +233,7 @@ class MCPServer:
             self.store,
             arguments["source"],
             SnapshotOptions(
-                profile_mode=arguments.get("profile_mode", "basic"),
+                profile_mode=arguments.get("profile_mode", "deep"),
                 row_limit=int(arguments.get("row_limit", 1000)),
                 timeout_seconds=parse_timeout(arguments.get("timeout", "5s")),
             ),

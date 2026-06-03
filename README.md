@@ -74,7 +74,7 @@ Inspect a source, refresh a snapshot, and query the local artifact:
 
 ```bash
 contextty inspect app-db
-contextty snapshot app-db --profile-mode deep --row-limit 10000 --timeout 5s
+contextty snapshot app-db --row-limit 10000 --timeout 5s
 contextty query "what tables explain signup state?" --source app-db --budget 2000
 ```
 
@@ -229,7 +229,9 @@ contextty source add app-db --type mysql --dsn-env MYSQL_DATABASE_URL
 contextty source add app-db --type mariadb --dsn-env MARIADB_DATABASE_URL
 contextty source add analytics-db --type duckdb --path ./analytics.duckdb
 contextty inspect app-db
-contextty snapshot app-db --profile-mode deep --row-limit 10000 --timeout 5s
+contextty snapshot app-db --row-limit 10000 --timeout 5s
+contextty list
+contextty create-report app-db
 contextty query "what tables explain signup state?" --source app-db --budget 2000
 contextty serve --api
 contextty serve --mcp
@@ -245,7 +247,9 @@ contextty serve --mcp
 | `contextty source add analytics-db --type duckdb --path ./analytics.duckdb` | Registers or updates a DuckDB source opened from a local database file. |
 | `contextty source list` | Lists registered sources from the local Contextty store. |
 | `contextty inspect app-db` | Connects to the registered source and returns schema metadata without writing a snapshot. |
-| `contextty snapshot app-db --profile-mode deep --row-limit 10000 --timeout 5s` | Builds or refreshes the local graph artifact for `app-db` using deep profiling, up to 10,000 sampled rows, and a 5 second statement timeout. |
+| `contextty snapshot app-db --row-limit 10000 --timeout 5s` | Builds or refreshes the local graph artifact for `app-db` using deep profiling by default, up to 10,000 sampled rows, and a 5 second statement timeout. Successful snapshots also write `.contextty/reports/app-db.html`. |
+| `contextty list` | Lists the latest successful snapshot artifacts by source name. You can also pass `.contextty` or a direct `contextty.db` path. |
+| `contextty create-report app-db` | Regenerates `.contextty/reports/app-db.html` from the latest successful snapshot artifact. |
 | `contextty query "what tables explain signup state?" --source app-db --budget 2000` | Queries the latest local artifact only, returning context for the question within a 2,000 word budget. |
 | `contextty graph --source app-db` | Returns the latest local graph summary for a source. |
 | `contextty serve --api` | Starts the local HTTP API server, defaulting to `127.0.0.1:8765`. |

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
-from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import click
@@ -14,9 +14,11 @@ from .mcp_server import MCPServer
 from .models import CONNECTOR_TYPES, SnapshotOptions
 from .services import (
     add_source,
+    create_report,
     detect,
     graph_summary,
     inspect_source,
+    list_artifacts,
     list_sources,
     query_context,
     refresh_snapshot,
@@ -24,8 +26,8 @@ from .services import (
 from .storage import LocalStore
 
 
-def _store() -> LocalStore:
-    return LocalStore()
+def _store(contextty_path: str | None = None) -> LocalStore:
+    return LocalStore(_store_path_from_argument(contextty_path) if contextty_path else None)
 
 
 def _json(data: Any) -> None:
@@ -110,7 +112,7 @@ def inspect_cmd(source_name: str, timeout: str) -> None:
 
 @main.command("snapshot")
 @click.argument("source_name")
-@click.option("--profile-mode", default="basic", show_default=True, type=click.Choice(["basic", "deep"]))
+@click.option("--profile-mode", default="deep", show_default=True, type=click.Choice(["basic", "deep"]))
 @click.option("--row-limit", default=1000, show_default=True, type=int)
 @click.option("--timeout", default="5s", show_default=True, help="Statement timeout, e.g. 500ms, 5s, 1m.")
 def snapshot_cmd(source_name: str, profile_mode: str, row_limit: int, timeout: str) -> None:
@@ -126,6 +128,27 @@ def snapshot_cmd(source_name: str, profile_mode: str, row_limit: int, timeout: s
             ),
         )
         _json(result)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("list")
+@click.argument("contextty_path", required=False, type=click.Path())
+def list_cmd(contextty_path: str | None) -> None:
+    """List latest successful snapshot artifacts."""
+    try:
+        _json(list_artifacts(_store(contextty_path)))
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("create-report")
+@click.argument("artifact_name")
+@click.argument("contextty_path", required=False, type=click.Path())
+def create_report_cmd(artifact_name: str, contextty_path: str | None) -> None:
+    """Regenerate the HTML report for a snapshot artifact."""
+    try:
+        _json(create_report(_store(contextty_path), artifact_name))
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -185,6 +208,17 @@ def _run_uvicorn(host: str, port: int) -> None:
 
 def _detect_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _store_path_from_argument(contextty_path: str | None) -> Path | None:
+    if not contextty_path:
+        return None
+    path = Path(contextty_path)
+    if path.exists() and path.is_dir():
+        return path / "contextty.db"
+    if path.name == "contextty.db" or path.suffix == ".db":
+        return path
+    return path / "contextty.db"
 
 
 def _candidate_label(candidate: dict[str, Any]) -> str:

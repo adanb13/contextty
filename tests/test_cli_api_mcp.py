@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from contextty.api import create_app
+from contextty.api import SnapshotRequest, create_app
 from contextty.cli import main
 from contextty.detect import detect_project
 from contextty.mcp_server import MCPServer
+from contextty.models import SnapshotOptions
 from contextty.storage import LocalStore
 
 from .helpers import populated_store, sqlite_fixture_db
@@ -79,6 +81,106 @@ def test_cli_sqlite_source_add_inspect_snapshot_and_query(tmp_path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "signup_state" in json.loads(result.output)["context"]
+
+
+def test_snapshot_defaults_are_deep_and_basic_can_be_explicit(tmp_path) -> None:
+    assert SnapshotOptions().profile_mode == "deep"
+    assert SnapshotOptions(profile_mode="basic").profile_mode == "basic"
+    assert SnapshotRequest(source="local-db").profile_mode == "deep"
+
+    cli_dir = tmp_path / "cli"
+    cli_dir.mkdir()
+    cli_db_path = sqlite_fixture_db(cli_dir)
+    cli_store_path = cli_dir / ".contextty" / "contextty.db"
+    runner = CliRunner()
+    env = {"CONTEXTTY_STORE_PATH": str(cli_store_path)}
+
+    result = runner.invoke(
+        main,
+        ["source", "add", "local-db", "--type", "sqlite", "--path", str(cli_db_path)],
+        env=env,
+    )
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(main, ["snapshot", "local-db", "--row-limit", "100"], env=env)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["run"]["profile_mode"] == "deep"
+    result = runner.invoke(main, ["snapshot", "local-db", "--profile-mode", "basic", "--row-limit", "100"], env=env)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["run"]["profile_mode"] == "basic"
+
+    api_dir = tmp_path / "api"
+    api_dir.mkdir()
+    api_db_path = sqlite_fixture_db(api_dir)
+    client = TestClient(create_app(LocalStore(api_dir / "contextty.db")))
+    created = client.post("/v1/sources", json={"name": "local-db", "type": "sqlite", "path": str(api_db_path)})
+    assert created.status_code == 200, created.text
+    snapshot = client.post("/v1/snapshot", json={"source": "local-db", "row_limit": 100})
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["run"]["profile_mode"] == "deep"
+    snapshot = client.post("/v1/snapshot", json={"source": "local-db", "profile_mode": "basic", "row_limit": 100})
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["run"]["profile_mode"] == "basic"
+
+    mcp_dir = tmp_path / "mcp"
+    mcp_dir.mkdir()
+    mcp_db_path = sqlite_fixture_db(mcp_dir)
+    server = MCPServer(LocalStore(mcp_dir / ".contextty" / "contextty.db"))
+    refresh_tool = next(tool for tool in server.list_tools() if tool["name"] == "refresh_snapshot")
+    assert refresh_tool["inputSchema"]["properties"]["profile_mode"]["default"] == "deep"
+    server.call_tool("add_source", {"name": "local-db", "type": "sqlite", "path": str(mcp_db_path)})
+    snapshot = server.call_tool("refresh_snapshot", {"source": "local-db", "row_limit": 100})
+    assert snapshot["run"]["profile_mode"] == "deep"
+    snapshot = server.call_tool("refresh_snapshot", {"source": "local-db", "profile_mode": "basic", "row_limit": 100})
+    assert snapshot["run"]["profile_mode"] == "basic"
+
+
+def test_cli_snapshot_writes_report_and_artifact_commands_accept_store_paths(tmp_path) -> None:
+    db_path = sqlite_fixture_db(tmp_path)
+    contextty_dir = tmp_path / ".contextty"
+    store_path = contextty_dir / "contextty.db"
+    runner = CliRunner()
+    env = {"CONTEXTTY_STORE_PATH": str(store_path)}
+
+    result = runner.invoke(
+        main,
+        ["source", "add", "local-db", "--type", "sqlite", "--path", str(db_path)],
+        env=env,
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(main, ["snapshot", "local-db", "--row-limit", "100"], env=env)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["run"]["profile_mode"] == "deep"
+    assert payload["report_path"].endswith(".contextty/reports/local-db.html")
+    report_path = Path(payload["report_path"])
+    assert report_path.exists()
+
+    html = report_path.read_text(encoding="utf-8")
+    assert "local-db" in html
+    assert f"Run #{payload['run']['id']}" in html
+    assert 'id="contextty-report-data"' in html
+    assert 'id="graph-map"' in html
+    assert "signup_state" in html
+    assert "foreign_key_to" in html
+    assert "value_domain" in html
+
+    for contextty_path in (None, str(contextty_dir), str(store_path)):
+        args = ["list"] if contextty_path is None else ["list", contextty_path]
+        result = runner.invoke(main, args, env=env)
+        assert result.exit_code == 0, result.output
+        artifacts = json.loads(result.output)
+        assert artifacts[0]["name"] == "local-db"
+        assert artifacts[0]["run_id"] == payload["run"]["id"]
+        assert artifacts[0]["report_path"] == str(report_path)
+
+    report_path.unlink()
+    result = runner.invoke(main, ["create-report", "local-db", str(contextty_dir)], env=env)
+    assert result.exit_code == 0, result.output
+    regenerated = json.loads(result.output)
+    assert regenerated["name"] == "local-db"
+    assert regenerated["report_path"] == str(report_path)
+    assert report_path.exists()
 
 
 def test_cli_detect_noninteractive_outputs_json_without_registering(tmp_path, monkeypatch) -> None:

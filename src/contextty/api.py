@@ -36,7 +36,7 @@ class InspectRequest(BaseModel):
 
 class SnapshotRequest(BaseModel):
     source: str
-    profile_mode: str = "basic"
+    profile_mode: str = "deep"
     row_limit: int = 1000
     timeout: str | float = "5s"
     time_window: str = "day"

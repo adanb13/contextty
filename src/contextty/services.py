@@ -8,6 +8,7 @@ from .detect import detect_project
 from .facts import facts_from_pills
 from .graph import ContextGraph
 from .models import InspectionResult, SnapshotOptions, Source
+from .reports import report_path_for_source, write_snapshot_report
 from .snapshot import build_artifact
 from .storage import LocalStore
 
@@ -86,13 +87,18 @@ def refresh_snapshot(
                 "database": inspection.database,
             },
         )
-        return {
+        result = {
             "run": asdict(run),
             "nodes": len(nodes),
             "edges": len(edges),
             "pills": len(pills),
             "facts": len(facts),
         }
+        try:
+            result["report_path"] = str(write_snapshot_report(store, source.name, snapshot_run_id=run.id))
+        except Exception as report_exc:
+            result["report_error"] = str(report_exc)
+        return result
     except Exception as exc:
         store.finish_snapshot_run(run.id, "failed", error=str(exc))
         raise
@@ -138,6 +144,50 @@ def find_path(store: LocalStore, start_node_id: str, end_node_id: str, direction
 def graph_summary(store: LocalStore, source_name: str | None = None) -> dict[str, Any]:
     source_id = store.get_source(source_name).id if source_name else None
     return ContextGraph(store, source_id=source_id).graph_summary()
+
+
+def list_artifacts(store: LocalStore) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    for source in store.list_sources():
+        run = store.latest_snapshot_run(source.id)
+        if run is None:
+            continue
+        metadata = run.metadata or {}
+        report_path = report_path_for_source(store, source.name)
+        artifacts.append(
+            {
+                "name": source.name,
+                "source_name": source.name,
+                "source_id": source.id,
+                "connector_type": source.connector_type,
+                "run_id": run.id,
+                "profile_mode": run.profile_mode,
+                "row_limit": run.row_limit,
+                "timeout_seconds": run.timeout_seconds,
+                "finished_at": run.finished_at,
+                "database": metadata.get("database"),
+                "nodes": metadata.get("nodes", 0),
+                "edges": metadata.get("edges", 0),
+                "pills": metadata.get("pills", 0),
+                "facts": metadata.get("facts", 0),
+                "report_path": str(report_path) if report_path.exists() else None,
+            }
+        )
+    return artifacts
+
+
+def create_report(store: LocalStore, artifact_name: str) -> dict[str, Any]:
+    source = store.get_source(artifact_name)
+    run = store.latest_snapshot_run(source.id)
+    if run is None:
+        raise KeyError(f"successful snapshot artifact not found: {artifact_name}")
+    report_path = write_snapshot_report(store, source.name, snapshot_run_id=run.id)
+    return {
+        "name": source.name,
+        "source_name": source.name,
+        "run": asdict(run),
+        "report_path": str(report_path),
+    }
 
 
 def _inspect_and_profile(

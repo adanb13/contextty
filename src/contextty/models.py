@@ -147,7 +147,7 @@ class TableProfile:
 
 @dataclass(slots=True)
 class SnapshotOptions:
-    profile_mode: ProfileMode = "basic"
+    profile_mode: ProfileMode = "deep"
     row_limit: int = 1000
     timeout_seconds: float = 5.0
     time_window: str = "day"

@@ -174,6 +174,26 @@ def test_deep_sqlite_snapshot_row_facts_answer_bounded_row_questions(tmp_path) -
     assert "Product=4" in reviews["context"]
 
 
+def test_report_render_failure_preserves_successful_snapshot(tmp_path, monkeypatch) -> None:
+    db_path = sqlite_fixture_db(tmp_path)
+    store = LocalStore(tmp_path / "contextty.db")
+    source = store.add_source("local-db", "sqlite", path=db_path)
+
+    def fail_report(*_args, **_kwargs) -> None:
+        raise RuntimeError("report renderer failed")
+
+    monkeypatch.setattr("contextty.services.write_snapshot_report", fail_report)
+
+    snapshot = refresh_snapshot(store, "local-db", SnapshotOptions(row_limit=100, timeout_seconds=5))
+
+    assert snapshot["report_error"] == "report renderer failed"
+    assert "report_path" not in snapshot
+    run = store.latest_snapshot_run(source.id)
+    assert run is not None
+    assert run.status == "success"
+    assert store.get_nodes(source.id)
+
+
 def test_fact_index_search_uses_local_facts(tmp_path) -> None:
     store, source = populated_store(tmp_path)
 
